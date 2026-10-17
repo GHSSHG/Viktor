@@ -1,9 +1,10 @@
-"""Throughput: koi encoder (Dorado VCS path), Triton-fused decoder with CUDA-graph decode steps.
+"""Inference throughput: koi encoder (Dorado VCS path) + Triton-fused decoder with CUDA-graph decode steps.
 
-Input is an .npz from make_chunks.py (Dorado-style chunks, full-size only or mixed lengths), cut
-into consecutive batches of --batch chunks. Decoder weights are random, so each batch runs a fixed
-number of decode steps: the expected output length of its longest chunk (+ EOS). Throughput counts
-new bases only (overlap and repeat padding excluded), at 12.5 samples per base.
+Input is an .npz from make_chunks.py (Dorado-style chunks, full-size only or mixed lengths), cut into
+consecutive batches of --batch chunks. Decoder weights are random, so each batch runs a fixed number of
+decode steps: the expected output length of its longest chunk (+ EOS). Throughput counts new bases only
+(overlap and repeat padding excluded), at 12.5 samples per base. Stages are timed separately (encoder,
+prefill, decode) and end to end (encoder + generate per batch, outputs copied to the CPU).
 
 Example:
   CUDA_VISIBLE_DEVICES=0 python -m scripts.bench --model-dir MODEL --tokenizer 4mer --chunks results/chunks_vcs_2048.npz
@@ -17,7 +18,7 @@ import time
 import numpy as np
 import torch
 
-from viktor import Basecaller, DecodeEngine, Pipeline, get_tokenizer, load_dorado_encoder
+from viktor import Basecaller, DecodeEngine, get_tokenizer, load_dorado_encoder
 
 SAMPLES_PER_BASE = 12.5
 
@@ -36,12 +37,11 @@ def main():
     ap.add_argument("--model-dir", required=True)
     ap.add_argument("--tokenizer", choices=["base", "4mer"], required=True)
     ap.add_argument("--chunks", required=True, help=".npz from make_chunks.py")
+    ap.add_argument("--n-chunks", type=int, default=None, help="use only the first N chunks (default: all)")
     ap.add_argument("--batch", type=int, default=256)
-    ap.add_argument("--n-chunks", type=int, default=256, help="input limit; defaults to one batch of 256 chunks")
     ap.add_argument("--prefill-batch", type=int, default=128)
     ap.add_argument("--backend", choices=["triton", "torch"], default="triton")
-    ap.add_argument("--attention-backend", choices=["auto", "flash", "split", "split2", "split4", "triton64", "triton256"], default="auto")
-    ap.add_argument("--prefill-mode", choices=["last", "full"], default="last")
+    ap.add_argument("--attention-backend", choices=["auto", "triton", "flash"], default="auto")
     ap.add_argument("--json", default=None, help="append the result as one JSON line to this file")
     args = ap.parse_args()
 
@@ -59,7 +59,7 @@ def main():
     offs = np.concatenate([[0], np.cumsum(lens)])
     n_batches = len(lens) // args.batch
     if n_batches == 0:
-        ap.error("--n-chunks and the dataset must contain at least --batch chunks")
+        ap.error("need at least --batch chunks")
     batches, steps, new_bases = [], [], 0.0
     for i in range(n_batches):
         a, b = i * args.batch, (i + 1) * args.batch
@@ -71,29 +71,29 @@ def main():
     torch.cuda.reset_peak_memory_stats()
     engine = DecodeEngine(model, args.batch, max(steps), encoder.chunksize // encoder.stride,
                           backend=args.backend, prefill_batch=args.prefill_batch,
-                          attention_backend=args.attention_backend, prefill_mode=args.prefill_mode)
-    pipe = Pipeline(model, engine)
+                          attention_backend=args.attention_backend)
+
+    def end_to_end():
+        for b, st in zip(batches, steps):
+            frames, flens = encoder.encode_chunks(*b)
+            engine.generate(frames, flens, st).to("cpu", copy=True)
 
     with torch.no_grad():
-        frames, flens = zip(*[encoder.encode_chunks(*b) for b in batches])
-        pipe.run(batches[:2], steps[:2])  # warm-up
+        encoded = [encoder.encode_chunks(*b) for b in batches]
+        end_to_end()  # warm-up
         t_enc = timed(lambda: [encoder.encode_chunks(*b) for b in batches])
-        t_pre = timed(lambda: [engine.prefill(f, fl) for f, fl in zip(frames, flens)])
-        t_all = timed(lambda: [engine.generate(f, fl, st) for f, fl, st in zip(frames, flens, steps)])
-    t_seq = timed(lambda: pipe.run(batches, steps, overlap=False))
-    t_pipe = timed(lambda: pipe.run(batches, steps, overlap=True))
+        t_pre = timed(lambda: [engine.prefill(f, fl) for f, fl in encoded])
+        t_gen = timed(lambda: [engine.generate(f, fl, st) for (f, fl), st in zip(encoded, steps)])
+        t_all = timed(end_to_end)
 
     res = {
         "gpu": torch.cuda.get_device_name(), "chunks": args.chunks, "tokenizer": args.tokenizer,
-        "backend": args.backend, "batch": args.batch, "n_chunks": n_chunks,
-        "attention_backend": engine.fast.attention_backend if engine.backend == "triton" else "torch",
-        "prefill_mode": args.prefill_mode,
-        "full_chunks": int((lens[:n_chunks] == encoder.chunksize).sum()), "steps": steps,
+        "backend": args.backend, "attention_backend": engine.fast.attention_backend if engine.backend == "triton" else "torch",
+        "batch": args.batch, "n_chunks": n_chunks, "full_chunks": int((valid[:n_chunks] == encoder.chunksize).sum()),
+        "steps": steps,
         "ms_per_chunk": {k: round(v / n_chunks * 1e3, 4) for k, v in
-                         {"encoder": t_enc, "prefill": t_pre, "decode": t_all - t_pre,
-                          "sequential": t_seq, "pipeline": t_pipe}.items()},
-        "bases_per_s": {"encoder_only": round(new_bases / t_enc), "sequential": round(new_bases / t_seq),
-                        "pipeline": round(new_bases / t_pipe)},
+                         {"encoder": t_enc, "prefill": t_pre, "decode": t_gen - t_pre, "total": t_all}.items()},
+        "bases_per_s": {"encoder_only": round(new_bases / t_enc), "total": round(new_bases / t_all)},
         "peak_allocated_gib": round(torch.cuda.max_memory_allocated() / 2**30, 2),
         "peak_reserved_gib": round(torch.cuda.max_memory_reserved() / 2**30, 2),
     }

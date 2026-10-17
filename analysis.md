@@ -1,282 +1,136 @@
-# Dorado Encoder + 小型 Decoder-only Basecaller 分析
+# 现状与难点分析
 
-日期：2026-10-12
+更新：2026-10-18。除注明“估算”外，数字均为服务器实测。GPU 为 NVIDIA DRIVE PG199（A100 架构，sm80，**96 个 SM**，32 GB，理论带宽约 **1.44 TB/s**）。
 
-本文汇总截至目前的讨论，作为后续模型设计和性能验证的依据。性能数字均为估算，尚未在 A100 上实测。
+## 1. 结论摘要
 
-## 1. 当前结论与设计方向
+- **编码器已经做到 Dorado 的水平。** 用 koi VCS kernel 跑编码器只需 0.96 ms/chunk；配合 koi 束搜索，在 100 条 HG002 read 上和 Dorado 2.1.2 的编辑距离为 0.059%。
+- **当前推理速度（B=256，随机权重）：**
+  - 4-mer：2.88 ms/chunk，约 **32 万 bp/s**，约为 Dorado（约 69 万）的 46%；
+  - 单碱基：8.2 ms/chunk，约 11.4 万 bp/s（B=512 时 7.5 ms，约 12.5 万）。
+- **现有架构下，工程优化基本到头了。**
+  - 解码 attention 已达到约 80% 的带宽；
+  - FlashAttention、cuDNN、FlashInfer 都不比现在的 kernel 快；
+  - 融合逐元素操作只能再省 2–3%；
+  - MPS 切分 SM 做流水，反而慢了 20%。
+- **剩下的提速空间来自改结构**，都需要在训练前决定：
+  - 减少每步读取的 KV：MLA、MQA、少层加宽、只让部分层读前缀、局部窗口；
+  - 选择 tokenizer（1-mer、2-mer、4-mer）。
 
-当前优先方案：
+  INT8 KV 不改模型，可以在训练后再决定。
+- **还没有训练过。** 准确率、真实输出长度下的吞吐，都还没有任何数据。
 
-```text
-Nanopore 信号 chunk：12288 个采样点
-    ↓
-Dorado SUP 卷积 + Transformer Encoder
-    ↓
-1024 帧 × 512 维，保留原始时间分辨率
-    ↓
-逐帧 Projector，映射到 Decoder 输入空间
-    ↓
-小型 Decoder-only，信号作为前缀
-    ↓
-固定长度 4-mer 自回归输出，展开为碱基序列
-```
+## 2. 实测结果
 
-已确定的方向：
+### 2.1 和 Dorado 的一致性（100 条 HG002 read，minimap2 比对 hg002v1.2）
 
-- 使用 Dorado SUP Encoder，以及与 Dorado 相同的高效推理实现。
-- 缩小 Decoder，改用信号前缀 + decoder-only 的连接方式。
-- 使用静态或分页 KV cache、CUDA Graph、融合 kernel 等优化。
-- 不采用 CRF 草稿投机解码。
-- 当前不采用输入帧压缩，优先保护 Encoder 的时间分辨率。
-- 将 4-mer 作为优先验证的输出方案，单碱基输出作为对照。
-- 后续考虑不同批次之间的 Encoder/Decoder 流水并行。
+| 方案 | 平均 identity | 中位数 |
+|---|---|---|
+| 官方 Dorado 2.1.2 SUP v5.2.0 | 98.490% | 99.591% |
+| 本仓库 koi VCS 编码器 + koi 束搜索 + mux-change 尾部裁剪 | 98.487% | 99.596% |
 
-速度目标是与 Dorado 处于相同数量级，不要求完全达到相同吞吐。单碱基方案如果准确率收益足够大，也仍在可接受的候选范围内。
+和 Dorado 逐 read 比较：编辑距离 0.059%，31/100 条完全相同。
 
-“不压缩输入”是当前的保守设计选择；现阶段没有实验结果证明四帧压缩必然导致明显退化。
+这里的 identity 是“匹配数 / 比对块长度”，**和 SUPEncoder 的 chunk 级全局 identity 不是同一口径**。后面评估训练出来的模型时，应该改用 SUPEncoder 的口径（见 5.3 节）。
 
-## 2. 已核对的 Dorado SUP 配置
+### 2.2 推理速度（B=256，2048 个真实 chunk 中的前 256 个，单位 ms/chunk）
 
-讨论基于 `dna_r10.4.1_e8.2_400bps_sup@v5.2.0`，不代表所有 Dorado SUP 版本。
+| | 编码器 | prefill | 解码 | 合计 | 吞吐 |
+|---|---|---|---|---|---|
+| 4-mer | 0.96 | 0.53 | 1.41 | 2.88–2.93 | 约 32 万 bp/s |
+| 单碱基 | 0.96 | 0.53 | 6.66 | 8.18 | 约 11.4 万 bp/s |
 
-| 项目 | 配置 |
+### 2.3 这一阶段做过的优化
+
+| 优化 | 效果 |
 |---|---|
-| 采样率 | 5000 Hz |
-| 名义过孔速度 | 400 bases/s |
-| 输入 chunk | 12288 个采样点 |
-| chunk 重叠 | 600 个采样点 |
-| 卷积 | 5 层，总 stride = 12 |
-| Transformer | 18 层，hidden = 512，8 heads |
-| FFN | 门控 FFN，配置维度 2048 |
-| 注意力窗口 | `[127, 128]` |
-| Transformer 输出 | 1024 帧 × 512 维 |
-| 线性上采样 | 时间长度 ×2，输出 2048 帧 |
-| CRF | state_len = 5，4096 个可训练转移分数/帧 |
-| Encoder 参数量 | 约 79M 量级，具体计数依模块边界 |
+| koi VCS 编码器，替代 PyTorch 编码器 | 2.86 → 0.96 ms |
+| Triton 融合 kernel（add+RMSNorm、QK-norm+RoPE+写 KV、SwiGLU） | prefill 0.87 → 0.59 ms |
+| **修正 FlashAttention 的 kernel 选择**：cache 已经提前写好时，FA2 会选通用 kernel；传入恒等 `cache_batch_idx` 并设 `num_splits=1` 后，才会走 split-KV 解码 kernel | 单层 attention 196 → 136 µs；4-mer 解码 1.90 → 1.49 ms |
+| 自写的 GQA 解码 attention（每个 KV 头只读一次，同时服务 4 个 Q 头） | 再快约 5%（1.49 → 1.41 ms） |
+| prefill 最后一层只计算 BOS 位置 | 0.59 → 0.53 ms |
+| 送进 decoder 之前去掉补齐帧 | 不再把重复信号当成 DNA 来解码 |
 
-按平均过孔速度计算，一个完整 chunk 对应约 983 个碱基；扣除重叠，连续长 read 的每个 chunk 新增约 935 个碱基。局部过孔速度和碱基数量并不固定。
+### 2.4 做过但没有采用的
 
-Dorado 的 CRF 可训练参数少，但提供序列路径、stay/move 和单调推进约束。强 Encoder 支持较小 Decoder，不等于新 Decoder 无需承担对齐、长度判断和终止任务。
-
-需要纠正此前记录中的说法：不能断言 Dorado CRF 每个碱基硬性需要两帧，也不能直接套用普通 CTC 的重复折叠规则。线性上采样提供更细的输出时间网格。
-
-## 3. Decoder 的当前设定
-
-| 项目 | 设定 |
+| 尝试 | 结果 |
 |---|---|
-| 层数 | 8 |
-| hidden size | 512 |
-| Q heads | 8 |
-| KV heads | 2，GQA |
-| head dimension | 64 |
-| FFN | SwiGLU，intermediate size = 1536 |
-| 主干参数量 | 约 24.1M |
-| 推理精度 | FP16/BF16，KV 为两字节精度 |
-| 解码方式 | 每个 chunk 一条自回归路径，优先贪心解码 |
+| FlashInfer 0.3.1 / 0.6.10（CUDA core 版和 tensor core 版） | 单层 attention 130–135 µs，比现在的 107 µs 慢；完整解码 1.41 → 1.59 ms |
+| cuDNN SDPA / torch flash | 110 µs / 187 µs |
+| cuBLASLt、Inductor 自动调优的 GEMM | 不比 cuBLAS 快 |
+| KV 切分（2 份、4 份） | 没有收益 |
+| 选 token 的逻辑融合成一个 kernel；gate_up 与 SwiGLU 融合 | 合计 2.94 → 2.87 ms/chunk（−2.3%）。B=512 时 GEMM 融合反而变慢 |
+| 每 4 步录一个 CUDA Graph | 0.13%，说明 kernel 之间的启动间隔不是瓶颈 |
+| 编码器和解码器双 stream 跨批次重叠 | +1.5% |
+| MPS 静态切分 SM（编码器 60%，解码器 40%） | **慢了 19.8%**。attention 只用 40% 的 SM 只慢 11%，但 GEMM、prefill 和编码器都随 SM 数下降 |
 
-Encoder 输出与 Decoder hidden 都是 512 维，但维度相同不代表表示空间已经匹配。Projector 可以逐帧映射，保留全部 1024 个时间位置。
+## 3. 成本模型（4-mer，B=256）
 
-4-mer 的完整块词表为 256 类。若采用 1/2/3-mer 处理末尾不足四个碱基的部分，则碱基组合共有 340 类，再加特殊 token。应明确限制短 token 只用于合法尾部，避免无意中产生任意长度分块。
+| 部分 | 每个 chunk | 性质 |
+|---|---|---|
+| 编码器 | 0.96 ms，每个采样点约 78 ns | 算力受限，和 chunk 长度成正比 |
+| prefill | 0.53 ms，约 100 TFLOPS | 算力受限 |
+| 解码 attention | 约 0.90 ms | 读 1.16 GB 的 KV，约 1.15–1.23 TB/s，约为峰值的 80% |
+| 解码中的其他部分 | 约 0.5 ms，即约 0.5 ms/步 ÷ batch | **主要是小 GEMM 本身的执行时间**：M=256 时每个 GEMM 至少 7–11 µs，只有 30–53 TFLOPS，而峰值是 248。kernel 之间的启动间隔不是主因 |
 
-8 层、约 25M 是起点，不是已证明的最佳配置。缩小 Decoder 是否保住难区准确率仍需实验。
+由此得出：
+- **每个碱基的 KV 读取量和 chunk 长度成正比。** 改成 4096 碱基的 chunk 后，4-mer 估算约 16.5–17.5 万 bp/s，单碱基约 4.2 万。
+- **每步固定开销和层数成正比。** 因为每层都有 4 个 GEMM，每个都有一个最低耗时。batch 加大时，GEMM 的耗时不会成倍增加，所以 B 越大，平摊到每条序列越少。
+- **现有架构下，单靠工程优化，4-mer 顺序执行的上限约 35–37 万 bp/s（B=512–1024）。**
 
-## 4. 输入帧压缩的风险及当前选择
+## 4. 待决定的结构选项（训练前）
 
-四帧拼接本身只是数据重排，不丢数值和顺序：
+以下是 4-mer、B=256 下的估算，按成本模型推出：
 
-```text
-4 × 512 → 拼接为 2048 维
-```
+| 选项 | 每 token 每层的 KV | 吞吐估算 | 风险 |
+|---|---|---|---|
+| 现在：8 × 512，GQA 8/2 | 256 个数（512 B） | 32 万 | — |
+| MQA | 128 | 约 38 万 | 注意力的表达能力下降，可能影响对齐 |
+| MLA，d_c = 128，d_r = 32 | 160 | 约 37 万 | 位置信息只在共享的 RoPE 分量里；需要自写解码 kernel（FlashMLA 只支持 sm90） |
+| 4 × 768，GQA，参数量相近 | 层数减半 | 约 41 万 | 层数太少可能完成不了对齐。不建议低于 4 层 |
+| 只让部分层读信号前缀 | 前缀读取量减半 | 约 38 万 | 改架构 |
+| 前缀局部窗口（按单调对齐） | 和 chunk 长度无关 | 最高 | 推理时要估计窗口中心，跟丢就会脱轨；必须在训练时就加上 |
+| 2-mer tokenizer | — | 约 21 万 | 介于单碱基和 4-mer 之间的折中 |
 
-后续投影到 512 维才引入明显瓶颈，同时四个独立时间位置变成一个位置，要求 Decoder 从通道内部读取局部时序结构。
+**训练后再决定的：** INT8 前缀 KV。前缀 KV 只写一次，可以按通道统计缩放系数；输出 token 的 KV 保留 bf16。预计 attention 从约 0.90 降到约 0.50 ms。训练全程用 bf16，INT8 只在推理时使用。
 
-| 方案 | 输出形状 | 相对原始特征元素数 |
-|---|---:|---:|
-| 原始输出 | 1024 × 512 | 100% |
-| 两帧拼接后投影到 512 | 512 × 512 | 50% |
-| 四帧拼接后投影到 1024 | 256 × 1024 | 50% |
-| 四帧拼接后投影到 512 | 256 × 512 | 25% |
+## 5. 训练（第一阶段：冻结编码器，用 koi 前向）
 
-元素数比例不是信息保留率，也不能换算成准确率。冗余特征可以压缩，但短事件、重复边界等低幅度证据也可能被削弱。
+### 5.1 已有
 
-四个 Transformer 帧覆盖约 9.6 ms，按平均速度约为 3.84 个碱基。这只是平均值，不允许将一组四帧强制对应一个 4-mer。
+- 模型、按碱基数归一化的 teacher-forcing loss、冻结开关。
+- 编码器冻结时，`Basecaller.forward` 会自动走 koi，decoder 看到的就是推理时的特征。
 
-重点风险是短停留事件、长同聚物计数、STR、低信噪比以及 chunk 边缘。当前保留全部帧，避免同时改变输入表示和输出粒度。
+### 5.2 还缺
 
-## 5. 4-mer 输出的准确率分析
+| 部分 | 内容 |
+|---|---|
+| 训练数据 | 按 Dorado 的方式切 12288 点、重叠 600 的 chunk，标签是每个 chunk 信号范围内的参考碱基。可以复用 BasecallerData 的 CRF 强制比对结果和 mask |
+| dataloader | 在线从 pod5 读取，用 `chunking.dorado_scale` 预处理，按长度分桶。第一版只用满长 chunk |
+| 训练脚本 | DDP、优化器、学习率调度、bf16、检查点、断点续训 |
+| 评估 | 用 `DecodeEngine` 做自由解码，在 chr20 留出集上算 chunk 级全局 identity 和脱轨率 |
+| 检查 | 打开 koi 时如果调用 `set_encoder_trainable(True)`，编码器拿不到梯度但不会报错，需要加检查 |
 
-固定 4-mer 切分在表示上可完整恢复序列。256 类联合 softmax 可以表示四个碱基的联合分布，不要求块内碱基相互独立。
+### 5.3 评估口径（沿用 SUPEncoder）
 
-但一次联合预测与四次单碱基预测存在计算和决策差异：
+- 全局比对（edlib NW）：identity = 1 − 编辑距离 / 参考长度；另外统计排除 mask 位置的版本。
+- 脱轨率：identity < 0.9 的 chunk 比例。
+- 基线：Dorado 在 chr20 留出集 1000 个 chunk 上平均 99.24%，中位 99.66%，脱轨率 1.0%。
 
-- 单碱基方案每输出一个碱基，重新执行一次 Decoder 主干。
-- 4-mer 方案每输出四个碱基，执行一次主干，需要一次完成局部联合判断。
-- 贪心选最可能的整个 4-mer，不一定等于最小化碱基编辑错误，也不一定等于单碱基逐步贪心结果。
-- 一次错误 token 可能只有一位错，也可能含多位错误；其反馈可能影响后续对齐。
+### 5.4 显存和 batch（估算，需实测确认）
 
-例如 `ACGT → ACGA` 是一个 token 错误，但只有一个碱基替换。假设各碱基独立且错误率为 1%，4-mer 至少错一位的概率约为 3.94%，不代表碱基错误率也变成 3.94%。
+decoder 每个 token 每层保存给反向传播的中间结果约 28 KB。
 
-插入删除会改变后续 4-mer 分组。碱基级只有一个 indel，token 级可能出现连续不匹配。因此评估必须先展开为碱基，再做序列比对。
+| | 4-mer | 单碱基 |
+|---|---|---|
+| 序列长度 | 1272 | 2010 |
+| 每个样本的激活 | 约 285 MB | 约 450 MB |
+| 每卡 batch 上限 / 建议值 | 约 80–90 / **64** | 约 50–55 / **32–48** |
 
-固定 4-mer 不强制所有长度错误都是四的倍数。通过后续内容重组和短尾部可以表达任意序列长度，但应检查同聚物长度错误中 ±4、±8 是否异常增加。
+4-mer 每卡 64 个样本、4 卡时，每步约 25 万碱基。SUPEncoder 每步约 15.7 万碱基。
 
-“少数极端值”的主要担忧不是 256 类词表太大，而是困难信号条件下的多位联合错误、错误传播和严重失败比例。常见 4-mer 在特殊停留时长、修饰或低质量信号下，仍可能缺乏充分训练覆盖。
+## 6. 依据
 
-质量值应按位置求边缘概率：
-
-```text
-P(位置 j 的碱基为 a | 当前上下文)
-    = 对所有位置 j 为 a 的 4-mer 概率求和
-```
-
-一个困难碱基可以拉低整个 4-mer 的概率，不应直接把 token 概率赋给四个碱基。边缘概率仍需校准，且不会自动涵盖历史对齐错误、漏读或错误终止的不确定性。
-
-## 6. A100 速度估算
-
-以下为性能规划估计，未实测。假设 Encoder 实现效率接近 Dorado，Decoder 已优化，batch 128–512、长 read 为主，不跑草稿 CRF，不使用 beam search。
-
-每个上下文 token 的全部 KV 为 4096 bytes。前缀长度 P、输出步数 N 时，逐步解码的简化逻辑 KV 读取量为：
-
-```text
-4096 × [N × P + N × (N - 1) / 2]
-```
-
-| 方案 | 前缀长度 | 输出步数 | 累计逻辑 KV 读取量/chunk |
-|---|---:|---:|---:|
-| 不压缩 + 单碱基 | 1024 | 983 | 约 6.10 GB |
-| 不压缩 + 4-mer | 1024 | 246 | 约 1.16 GB |
-
-这里 GB 是十进制累计访问量，不是同时驻留的显存。实际 HBM 流量受缓存、GQA kernel 和访存实现影响。
-
-两种方案都要对 1024 个信号 token 做 Decoder prefill，约 55–60 GFLOPs，此前估计约 0.4–0.8 ms/chunk 的批量摊销时间。4-mer 不减少这部分，只减少生成步数及生成期间的上下文读取。
-
-此前估计如下，保留作为实验前的参考：
-
-| 方案 | 顺序执行吞吐 | 流水吞吐估计 | 相对 Dorado |
-|---|---:|---:|---:|
-| 不压缩 + 单碱基 | 10–16 万 bp/s | 12–18 万 bp/s | 约 15%–30% |
-| 不压缩 + 4-mer | 24–37 万 bp/s | 优化良好时约 45–65 万 bp/s | 流水目标约 60%–90% |
-| Dorado SUP | 62–75 万 bp/s | 作为比较基线 | 100% |
-
-所有绝对数值及比例都不是实测结论。特别是 4-mer 流水范围偏乐观，不能承诺必然达到 Dorado 的 60%–90%。此前约 1.4–2.6 ms/chunk 的 Decoder 估计，对应完全独立、理想重叠时的吞吐约 36–67 万 bp/s；共享 GPU 的资源竞争还可能降低吞吐。
-
-上述 ms/chunk 是大 batch 下总时间除以 chunk 数的摊销成本，不是单个 chunk 的端到端延迟。
-
-流水在不同批次之间进行：当前批 Decoder 解码时，下一批 Encoder 计算。同一个 chunk 的 Decoder 仍依赖其 Encoder 结果。
-
-同一张 GPU 上计算和带宽不是独立资源，prefill 也使用 Tensor Core。完整重叠的 `max(T_encoder, T_decoder)` 只能作为理想参考，实际资源需求至少还受总 FLOPs、总 HBM 流量和 kernel 调度约束。
-
-目前可支持的判断：4-mer 显著降低 Decoder 成本，有机会实现与 Dorado 相同数量级的吞吐。无需把四帧输入压缩作为实现此目标的前提。
-
-## 7. 推理显存估算
-
-### 7.1 模型权重与 KV
-
-Decoder 主干约 24.1M 参数，半精度权重约 46 MiB。加轻量 Projector 和小词表后约 50 MiB 量级；移除上采样和 CRF 头可减少约 5 MiB 半精度权重。
-
-生成结束附近的 KV 数据量：
-
-| 解码并发 chunk 数 | 单碱基，1024 + 983 token | 4-mer，1024 + 246 token |
-|---:|---:|---:|
-| 128 | 0.98 GiB | 0.62 GiB |
-| 256 | 1.96 GiB | 1.24 GiB |
-| 512 | 3.92 GiB | 2.48 GiB |
-| 1024 | 7.84 GiB | 4.96 GiB |
-
-4-mer 的 KV 不减少四倍，因为 1024-token 前缀在两种方案中相同；batch 512 下仅前缀 KV 就占 2 GiB。
-
-### 7.2 静态 cache 的容量规划
-
-静态 cache 应按最大允许长度预留，不能用平均输出长度代替容量上限。
-
-例如，两种方案均允许最多约 2048 个输出碱基，暂忽略特殊 token：
-
-| 项目 | 单碱基 | 4-mer |
-|---|---:|---:|
-| 信号前缀 | 1024 token | 1024 token |
-| 最大输出 | 2048 token | 512 token |
-| 总 cache 容量 | 3072 token | 1536 token |
-| batch 128 | 1.50 GiB | 0.75 GiB |
-| batch 256 | 3.00 GiB | 1.50 GiB |
-| batch 512 | 6.00 GiB | 3.00 GiB |
-
-2048 碱基只是预算示例，实际上限需依据输出长度分布确定，另外预留特殊 token 位置。
-
-### 7.3 被替换的 Dorado CRF 缓冲
-
-已核对的固定长度 CUDA 路径中，每个 chunk 的半精度 CRF 分数为：
-
-```text
-2048 帧 × 4096 分数 × 2 bytes = 16 MiB
-```
-
-解码主要辅助缓冲为 `B × (T + 1) × (C + 4 × beam_width)` bytes。以 beam width = 32 举例，约 8.25 MiB/chunk；与分数矩阵同时存在。两者合计约 24.25 MiB/chunk。
-
-| 相同 batch | Dorado CRF 分数 + 主要辅助缓冲 | 单碱基实际 KV | 4-mer 实际 KV |
-|---:|---:|---:|---:|
-| 128 | 3.03 GiB | 0.98 GiB | 0.62 GiB |
-| 256 | 6.06 GiB | 1.96 GiB | 1.24 GiB |
-| 512 | 12.13 GiB | 3.92 GiB | 2.48 GiB |
-
-这是数据结构对照，不是全程序峰值。具体 Dorado 版本、可变 chunk 和 CRF 子批处理方式可能改变峰值。
-
-### 7.4 峰值显存与流水
-
-净显存不一定增加，因为移除 CRF 释放的缓冲可能大于新增 KV。但不能简单相减后宣称节省固定数量的显存：Encoder、prefill、CRF 在不同阶段的缓冲生命周期不同。
-
-我们的流水可能让 Decoder KV 与下一批 Encoder 工作空间同时存在。静态 cache 即使在顺序执行时也可能常驻。
-
-Encoder 输出每个 chunk 为 `1024 × 512 × 2 bytes = 1 MiB`。队列保留 512 个 chunk 占 0.5 GiB，两批占 1 GiB。
-
-以 batch 512、上述静态容量为例，相对裸 Encoder 新增：
-
-| 项目 | 单碱基 | 4-mer |
-|---|---:|---:|
-| 静态 KV | 6.00 GiB | 3.00 GiB |
-| 一批待处理 Encoder 输出 | 0.50 GiB | 0.50 GiB |
-| Decoder + 轻量 Projector 权重 | 约 0.05 GiB | 约 0.05 GiB |
-| 小计 | 约 6.55 GiB | 约 3.55 GiB |
-
-另计 prefill、单步工作空间、CUDA Graph 内存池、运行时和分配器缓存。相对完整 Dorado，还要扣除删除 CRF 带来的占用变化。
-
-流水不要求复制权重，也不自动要求两套完整 KV。如果在当前批结束前已为下一批做完 prefill，才需要同时保存下一批的 KV。
-
-建议将 Encoder batch、prefill batch 和 Decoder 并发量分别调优。可以分批 prefill 后汇入较大解码批次，控制临时激活峰值。
-
-分页 KV 的实际使用量与运行时预留池不同。与 Encoder 共用 GPU 时，应明确限制 Decoder 内存池，不能任其预留几乎全部可用显存。
-
-当前判断：显存没有显示出需要放弃 4-mer 的理由。A100 40GB/80GB 上新增的主要 KV 负担相对温和，但总峰值仍需实测。
-
-## 8. 准确率和工程验证
-
-优先实验顺序：
-
-1. 固定 Encoder 原始帧数，建立小型 decoder-only + 单碱基基线，与现有较大模型比较。
-2. 同样保留原始帧数，训练和评估 4-mer 方案，确认输出粒度的独立影响。
-3. 在 A100 测量真实 Dorado 基线及新方案的 Encoder、prefill、解码阶段。
-4. 验证顺序执行与跨批流水的吞吐和峰值显存，随后确定并发量。
-
-需要评估：碱基级 substitution/insertion/deletion、按真实长度分层的同聚物错误、STR、连续错误簇、最差 1% reads、严重失败和截断、真实变异保留、chunk 边界及完整 read、碱基级质量值校准。
-
-测试集按 read、样本等层级隔离，避免重叠 chunk 泄漏。无法比对或严重截断的 read 也应进入失败统计。
-
-比较 tokenizer 时先展开为碱基；训练损失按碱基数归一化，不能直接比较每 token 的交叉熵。4-mer 接口需要适配和继续训练，但不意味着 Decoder 主干必须从零预训练。
-
-不要仅报告准确率的百分点变化。例如 99.80% → 99.75% 看起来只降 0.05 个百分点，错误率却增加 25%。应预设可接受退化幅度，使用配对 read 级统计区间判断；没有显著差异不等于已证明等效。
-
-性能测量固定模型版本、精度、chunk/overlap、输出质量值设置及数据。分别报告稳态吞吐、端到端延迟、实际分配峰值、分配器预留和设备总占用。随机权重微基准可以验证执行成本，但不能替代真实输出长度和完整数据流程的测试。
-
-## 9. 依据与证据边界
-
-原始讨论记录为用户提供的 `qwen3_asr_basecaller_conversation.json`。本文还汇总了后续讨论中的修正，不照搬原记录的乐观结论。
-
-- [SUP v5.2.0 官方模型包，含 config.toml](https://cdn.oxfordnanoportal.com/software/analysis/dorado/dna_r10.4.1_e8.2_400bps_sup@v5.2.0.zip)
-- [Dorado TxModel 实现](https://github.com/nanoporetech/dorado/blob/b86d79e9bd6a83c38584d11b7839990f7ea5303e/dorado/basecall/model/TxModel.cpp)
-- [Transformer 和 CRF 打分实现](https://github.com/nanoporetech/dorado/blob/b86d79e9bd6a83c38584d11b7839990f7ea5303e/dorado/nn/TxModules.cpp)
-- [CRF CUDA 解码缓冲分配](https://github.com/nanoporetech/dorado/blob/b86d79e9bd6a83c38584d11b7839990f7ea5303e/dorado/basecall/decode/CUDADecoder.cpp)
-- [Bonito CTC-CRF 实现](https://github.com/nanoporetech/bonito/blob/master/bonito/crf/model.py)
-
-配置核对针对 v5.2.0 模型；缓冲区分析引用上述固定提交的 Dorado 实现，两者不应视为同一历史发布版本的完整实测。
-
-已核对的是模型配置、相关代码中的张量结构以及算术推算。尚未验证的是小 Decoder 的准确率、4-mer 的困难区域表现、A100 实际吞吐、流水重叠效率、完整程序峰值显存，以及质量值校准效果。
+- 实测记录在服务器 `~/Work/Viktor/results/`：`accuracy_100reads.txt`、`speed_bench_koi.jsonl`、`speed_bench_varlen_triton.jsonl`。
+- Dorado 参考实现：[TxModel](https://github.com/nanoporetech/dorado/blob/b86d79e9bd6a83c38584d11b7839990f7ea5303e/dorado/basecall/model/TxModel.cpp)、[TxModules](https://github.com/nanoporetech/dorado/blob/b86d79e9bd6a83c38584d11b7839990f7ea5303e/dorado/nn/TxModules.cpp)；koi 用的是 ONT CDN 上的预编译 libkoi 0.7.5。
+- 模型：[SUP v5.2.0 官方模型包](https://cdn.oxfordnanoportal.com/software/analysis/dorado/dna_r10.4.1_e8.2_400bps_sup@v5.2.0.zip)，服务器上的权重已确认和 CDN 版本逐字节相同。

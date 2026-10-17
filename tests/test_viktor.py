@@ -4,7 +4,7 @@ import random
 import pytest
 import torch
 
-from viktor import (BOS, EOS, PAD, Basecaller, DecodeEngine, DecoderConfig, DoradoEncoder, Pipeline,
+from viktor import (BOS, EOS, PAD, Basecaller, DecodeEngine, DecoderConfig, DoradoEncoder,
                     KmerTokenizer, load_dorado_encoder)
 
 MODEL_DIR = os.environ.get("VIKTOR_DORADO_MODEL")
@@ -101,16 +101,6 @@ def test_encode_chunks_drops_padding_frames():
         frames, flens = model.encoder.encode_chunks(sig, lens, valid)
     assert flens == [128, 33]  # ceil(130 / stride 4)
     assert torch.equal(frames, torch.cat([packed[:128], packed[128:161]]))
-
-
-def test_pipeline_matches_sequential():
-    model = tiny_model(4)
-    batches = [(torch.randn(768), [256, 512], [200, 512]) for _ in range(3)]
-    eng = DecodeEngine(model, 2, 12, 128, backend="torch")
-    pipe = Pipeline(model, eng)
-    a = pipe.run(batches, overlap=True)
-    b = pipe.run(batches, overlap=False)
-    assert all(torch.equal(x, y) for x, y in zip(a, b))
 
 
 def test_loss_backward_and_freeze():

@@ -1,1 +1,0 @@
-{"status": "passed", "backend": "auto", "tokenizer": "base", "batch": 256, "steps": 985, "prefill_token_agreement": 1.0, "teacher_forced_max_logit_error": 0.015625, "prefill_max_logit_error": 0.000244140625, "cache_exact": true, "graph_eager_exact": true}

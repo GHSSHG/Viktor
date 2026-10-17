@@ -1,6 +1,6 @@
 """GPU checks (needs CUDA, flash-attn, triton, libkoi). Prints a short report; exits non-zero on failure.
 
-  1. Triton kernels vs their PyTorch definitions
+  1. Triton kernels (fused ops, decode attention) vs their PyTorch definitions
   2. koi VCS encoder: a mixed-length batch equals encoding each chunk alone; agreement with the PyTorch encoder
   3. Fused decoder (triton backend) vs reference decoder (torch backend): prefill logits, greedy tokens
   4. CUDA graph vs eager decode steps: identical tokens
@@ -16,6 +16,7 @@ import torch
 import torch.nn.functional as F
 
 from viktor import Basecaller, DecodeEngine, get_tokenizer, load_dorado_encoder
+from viktor.decode_attention import decode_attention
 from viktor.encoder import apply_rope
 from viktor.triton_ops import add_rmsnorm, qkv_rope_cache, swiglu
 
@@ -66,6 +67,20 @@ def check_kernels(dev):
            f"max |q - ref| {dq:.4f}, |k - ref| {dk:.4f}, v exact {torch.equal(v, vr)}, cache rows {cache_ok}")
 
 
+def check_decode_attention(dev):
+    torch.manual_seed(0)
+    B, H, HKV, D, S = 64, 8, 2, 64, 1300
+    lens = torch.cat([torch.tensor([1, 63, 64, 65]), torch.randint(1, S + 1, (B - 4,))]).int().to(dev)
+    q = torch.randn(B, H, D, device=dev, dtype=torch.bfloat16)
+    k, v = (torch.randn(B, S, HKV, D, device=dev, dtype=torch.bfloat16) for _ in range(2))
+    out = decode_attention(q, k, v, lens)
+    mask = (torch.arange(S, device=dev)[None] < lens[:, None].long())[:, None, None]  # [B, 1, 1, S]
+    ref = F.scaled_dot_product_attention(q[:, :, None].float(), k.transpose(1, 2).float().repeat_interleave(H // HKV, 1),
+                                         v.transpose(1, 2).float().repeat_interleave(H // HKV, 1), attn_mask=mask)[:, :, 0]
+    err = (out.float() - ref).abs().max()
+    report("decode_attention", err < 0.01, f"max |out - fp32 ref| {err:.4f}, lengths incl. 1/63/64/65")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-dir", required=True)
@@ -74,6 +89,7 @@ def main():
     args = ap.parse_args()
     dev = torch.device("cuda")
     check_kernels(dev)
+    check_decode_attention(dev)
 
     z = np.load(args.chunks)
     lens = z["lens"][:args.n]

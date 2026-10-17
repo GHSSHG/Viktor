@@ -7,3 +7,4 @@ models/
 results/
 *.pod5
 third_party/
+benchmarks/

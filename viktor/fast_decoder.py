@@ -20,12 +20,13 @@ class FastDecoder:
             "kernels need power-of-two head counts and head_dim / 2"
         self.dec, self.cfg = dec, cfg
         if attention_backend == "auto":
+            # decode_attention.py is tuned for sm80, bf16, GQA 8/2, head_dim 64; FlashAttention otherwise
             weight = dec.lm_head.weight
             tuned = (cfg.n_heads, cfg.n_kv_heads, cfg.head_dim) == (8, 2, 64)
             tuned = tuned and weight.dtype == torch.bfloat16 and weight.is_cuda
             tuned = tuned and torch.cuda.get_device_capability(weight.device) == (8, 0)
-            attention_backend = "triton64" if tuned else "split"
-        if attention_backend not in ("flash", "split", "split2", "split4", "triton64", "triton256"):
+            attention_backend = "triton" if tuned else "flash"
+        if attention_backend not in ("triton", "flash"):
             raise ValueError(f"unknown decode attention backend: {attention_backend}")
         self.attention_backend = attention_backend
 
@@ -69,17 +70,11 @@ class FastDecoder:
     def decode(self, x, pos, seq, cache_seqlens, cache: KVCache):
         """One token per sequence: x [B, d], pos/seq [B] int32, cache_seqlens = pos + 1 (int32)."""
         def attend(i, q):
-            if self.attention_backend.startswith("triton"):
+            if self.attention_backend == "triton":
                 from .decode_attention import decode_attention
-                return decode_attention(q, cache.k[i], cache.v[i], cache_seqlens,
-                                        block=int(self.attention_backend[6:]))
-            kw = {}
-            if self.attention_backend == "split":
-                # FA2 otherwise dispatches to the general forward kernel when K/V
-                # have already been written. Identity indices select its decode kernel.
-                kw = dict(cache_batch_idx=seq, num_splits=1)
-            elif self.attention_backend.startswith("split"):
-                kw = dict(num_splits=int(self.attention_backend[5:]))
-            return flash_attn_with_kvcache(q[:, None], cache.k[i], cache.v[i],
-                                          cache_seqlens=cache_seqlens, **kw)[:, 0]
+                return decode_attention(q, cache.k[i], cache.v[i], cache_seqlens)
+            # The cache is already written, so FA2 would pick its general forward kernel;
+            # identity cache_batch_idx with num_splits=1 selects the split-KV decode kernel.
+            return flash_attn_with_kvcache(q[:, None], cache.k[i], cache.v[i], cache_seqlens=cache_seqlens,
+                                          cache_batch_idx=seq, num_splits=1)[:, 0]
         return self._layers(x, pos, seq, cache, attend, return_kv=False)
