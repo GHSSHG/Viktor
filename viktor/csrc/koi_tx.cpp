@@ -119,8 +119,13 @@ public:
                double theta,
                int64_t max_seq_len,
                bool use_i8,
-               int64_t remove_bits)
-            : H(nhead), win_upper(win_upper), win_lower(win_lower), use_i8(use_i8) {
+               int64_t remove_bits,
+               bool swiglu_f32_accum)
+            : H(nhead),
+              win_upper(win_upper),
+              win_lower(win_lower),
+              use_i8(use_i8),
+              swiglu_f32_accum(swiglu_f32_accum) {
         if (koi_tc_is_available(KOI_F16) != KOI_SUCCESS) {
             throw std::runtime_error("koi tiled path not available on this device");
         }
@@ -273,7 +278,8 @@ private:
         check(koi_rmsnorm_residual(stream, &out_proj_ntc, &in_f16, L.alpha, &res_weights, &in_f16,
                                    nullptr, in_i8_ptr),
               "rmsnorm1");
-        check(koi_mm_swiglu(stream, &in_mk, &fc1_wts, &fc1_out, ctr[2].data_ptr<int>(), 0, 0),
+        check(koi_mm_swiglu(stream, &in_mk, &fc1_wts, &fc1_out, ctr[2].data_ptr<int>(),
+                            int(swiglu_f32_accum), 0),
               "fc1_swiglu");
         check(koi_linear(stream, &fc1_out_mk, &fc2_wts, nullptr, &fc2_out_mn,
                          ctr[3].data_ptr<int>()),
@@ -284,7 +290,7 @@ private:
     }
 
     int64_t H, C = 0, D = 0, E = 0, max_T = 0, win_upper, win_lower;
-    bool use_i8;
+    bool use_i8, swiglu_f32_accum;
     at::Tensor sincos_bfr;
     std::vector<Layer> layer_vec;
 };
@@ -292,6 +298,6 @@ private:
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     py::class_<KoiTxStack>(m, "KoiTxStack")
             .def(py::init<const std::vector<std::vector<at::Tensor>> &, const std::vector<double> &,
-                          int64_t, int64_t, int64_t, int64_t, double, int64_t, bool, int64_t>())
+                          int64_t, int64_t, int64_t, int64_t, double, int64_t, bool, int64_t, bool>())
             .def("forward", &KoiTxStack::forward);
 }

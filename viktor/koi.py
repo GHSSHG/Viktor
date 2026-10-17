@@ -50,7 +50,7 @@ class KoiTxStack:
     """Replaces encoder.transformer_encoder; built from its (fp16, CUDA) weights."""
 
     def __init__(self, transformer_encoder, nhead, dim_feedforward, attn_window, theta=10000.0,
-                 max_seq_len=4096, use_i8=True, remove_bits=4):
+                 max_seq_len=4096, use_i8=True, remove_bits=4, swiglu_f32_accum=False):
         ext = load_extension()
         layers, alphas = [], []
         for layer in transformer_encoder:
@@ -61,7 +61,7 @@ class KoiTxStack:
             alphas.append(float(layer.deepnorm_alpha))
         self.stack = ext.KoiTxStack(layers, alphas, nhead, dim_feedforward, int(attn_window[0]),
                                     int(attn_window[1]), float(theta), int(max_seq_len), use_i8,
-                                    int(remove_bits))
+                                    int(remove_bits), bool(swiglu_f32_accum))
 
     def __call__(self, x):
         return self.stack.forward(x.half().contiguous())
