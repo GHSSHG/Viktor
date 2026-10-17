@@ -64,13 +64,18 @@ def _combine(pp, lp, op, H: tl.constexpr, HK: tl.constexpr, D: tl.constexpr,
 
 
 def decode_attention(q, k, v, lengths, block=64, splits=1, warps=4):
-    """q [B,H,D], KV [B,S,Hkv,D], lengths [B] int32 (includes current token)."""
+    """q [B,H,D], KV [B,S,Hkv,D], lengths [B] int32 (includes current token).
+
+    Caller guarantees 1 <= lengths <= S. Only valid prefix positions are read.
+    """
     B, H, D = q.shape
     HK = k.shape[2]
     assert q.is_contiguous() and H % HK == 0 and H // HK <= 16 and D == 64
     assert q.dtype == k.dtype == v.dtype == torch.bfloat16
     assert k.stride() == v.stride() and k.stride(-1) == 1 and k.stride(-2) == D
     assert splits in (1, 2, 4, 8)
+    assert lengths.shape == (B,) and lengths.dtype == torch.int32 and lengths.is_contiguous()
+    assert block in (64, 128, 256) and warps in (2, 4, 8)
     out = torch.empty_like(q)
     partial = out if splits == 1 else torch.empty((B, HK, splits, H // HK, D), device=q.device, dtype=torch.float32)
     lse = out if splits == 1 else torch.empty((B, HK, splits, H // HK), device=q.device, dtype=torch.float32)

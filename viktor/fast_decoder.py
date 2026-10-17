@@ -55,7 +55,9 @@ class FastDecoder:
 
     def prefill(self, x, pos, seq, cu_seqlens, max_seqlen, cache: KVCache, last_indices=None, cu_queries=None):
         """x [n, d] packed prefix embeddings of several sequences; pos/seq [n] int32; cu_seqlens [b+1] int32.
-        Fills the cache rows of those sequences; returns hidden [n, d]."""
+        Fills the cache rows of those sequences. Returns hidden [n, d], or [b, d] at the final
+        position of each sequence when last_indices and cu_queries are provided together."""
+        assert (last_indices is None) == (cu_queries is None)
         def attend(i, r):
             q, k, v = r
             if last_indices is not None and i == self.cfg.n_layers - 1:

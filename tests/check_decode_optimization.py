@@ -26,8 +26,13 @@ def main():
     steps = 247 if args.tokenizer == "4mer" else 985
     ref = DecodeEngine(model, 256, steps, 1024, cuda_graph=False, attention_backend="flash", prefill_mode="full")
     opt = DecodeEngine(model, 256, steps, 1024, cuda_graph=False, attention_backend=args.backend, prefill_mode="last")
+    prefill_logits = []
+    handle = model.decoder.lm_head.register_forward_hook(lambda module, inputs, out: prefill_logits.append(out.float().clone()))
     ref.prefill(frames, lens)
     opt.prefill(frames, lens)
+    handle.remove()
+    torch.testing.assert_close(prefill_logits[1], prefill_logits[0], atol=0.025, rtol=0.025)
+    prefill_error = float((prefill_logits[1] - prefill_logits[0]).abs().max())
     # All prefix K/V must be identical: pruning only affects their unused final outputs.
     torch.testing.assert_close(ref.cache.k, opt.cache.k, atol=0, rtol=0)
     torch.testing.assert_close(ref.cache.v, opt.cache.v, atol=0, rtol=0)
@@ -61,7 +66,7 @@ def main():
         torch.testing.assert_close(ref.cache.v[:, b, :length+1], opt.cache.v[:, b, :length+1], atol=0, rtol=0)
     print(json.dumps(dict(status="passed", backend=args.backend, tokenizer=args.tokenizer, batch=256,
                           steps=steps, prefill_token_agreement=prefill_agree, teacher_forced_max_logit_error=worst,
-                          cache_exact=True, graph_eager_exact=True)), flush=True)
+                          prefill_max_logit_error=prefill_error, cache_exact=True, graph_eager_exact=True)), flush=True)
 
 
 if __name__ == "__main__":
