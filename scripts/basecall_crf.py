@@ -49,7 +49,7 @@ class CRFHead(torch.nn.Module):
 
 @torch.no_grad()
 def viterbi(scores):
-    """scores [N, F, 4096] -> per chunk (sequence, moves[F])."""
+    """scores [N, F, 4096] -> per chunk (sequence, None, moves[F])."""
     n, nf = scores.shape[:2]
     scores = scores.view(n, nf, NS, NB)
     dev = scores.device
@@ -70,35 +70,56 @@ def viterbi(scores):
                 seq.append("ACGT"[s % NB])
                 moves[t] = 1
                 s = predc[s, a - 1]
-        out.append(("".join(reversed(seq)), moves))
+        out.append(("".join(reversed(seq)), None, moves))
     return out
 
 
 def beam_search(scores, q_scale, q_shift):
-    """Dorado CUDADecoder::beam_search_part_1/2 on koi. scores [N, F, 4096] -> per chunk (sequence, moves[F])."""
+    """Dorado CUDADecoder::beam_search_part_1/2 on koi. scores [N, F, 4096] -> per chunk (sequence, qstring, moves[F])."""
     from viktor.koi import load_extension
     msq = load_extension().beam_search(scores, 0.0, 32, 100.0, 2.0, q_scale, q_shift, False).cpu().numpy()
     out = []
     for i in range(scores.shape[0]):
         moves = msq[0, i].astype(np.uint8)
-        out.append((msq[1, i, :int(moves.sum())].tobytes().decode(), moves))
+        nb = int(moves.sum())
+        out.append((msq[1, i, :nb].tobytes().decode(), msq[2, i, :nb].tobytes().decode(), moves))
     return out
 
 
 def stitch(chunks, n_samples, overlap):
-    """dorado utils::stitch_chunks with is_vcs=True. chunks: [(start, raw_size, seq, moves)]."""
-    seqs, start_pos, mid_front = [], 0, 0
-    for (s0, r0, seq0, mv0), (s1, _, _, mv1) in zip(chunks, chunks[1:]):
+    """dorado utils::stitch_chunks with is_vcs=True. chunks: [(start, raw_size, seq, qstring, moves)].
+    Returns (sequence, qstring or None)."""
+    spans, start_pos, mid_front = [], 0, 0
+    for (s0, r0, seq0, _, mv0), (s1, _, _, _, mv1) in zip(chunks, chunks[1:]):
         ov = (r0 + s0 - s1) // STRIDE
         mid_rear = ov // 2
-        end = len(seq0) - int(mv0[len(mv0) - mid_rear:].sum())
-        seqs.append(seq0[start_pos:end])
+        spans.append((start_pos, len(seq0) - int(mv0[len(mv0) - mid_rear:].sum())))
         mid_front = ov - mid_rear
         start_pos = int(mv1[:mid_front].sum())
-    _, r_last, seq_last, mv_last = chunks[-1]
+    _, r_last, _, _, mv_last = chunks[-1]
     keep = -(-min(n_samples, r_last) // STRIDE)
-    seqs.append(seq_last[start_pos:start_pos + int(mv_last[mid_front:keep].sum())])
-    return "".join(seqs)
+    spans.append((start_pos, start_pos + int(mv_last[mid_front:keep].sum())))
+    seq = "".join(c[2][a:b] for c, (a, b) in zip(chunks, spans))
+    qs = None if chunks[0][3] is None else "".join(c[3][a:b] for c, (a, b) in zip(chunks, spans))
+    return seq, qs
+
+
+def mux_change_trim(seq, qstring):
+    """dorado utils::mux_change_trim_read (reads ending in a mux change / unblock): trim the low-quality tail."""
+    n = len(qstring)
+    if n < 100:
+        return seq
+    trim, cum, cum_min = n - 1, 0, -1
+    for i in range(n - 1, -1, -1):
+        q = ord(qstring[i])
+        cum += -1 if q <= 7 + 33 else (1 if q <= 12 + 33 else 10)
+        if cum <= cum_min:
+            cum_min, trim = cum, i - 1
+        if cum > i:
+            break
+    if trim < int(n * 0.3) or trim >= n - 5:
+        return seq
+    return seq[:trim]
 
 
 def main():
@@ -120,12 +141,15 @@ def main():
     decode = (lambda s: beam_search(s, q["scale"], q["bias"])) if args.decoder == "beam" else viterbi
 
     reads, items = {}, []  # items: (read_id, chunk_idx, start, raw_size, padded signal)
+    mux = set()
     with pod5.Reader(args.pod5) as r:
         for rec in r.reads():
             x = scale_record(rec, enc.mean, enc.stdev)
             rid = str(rec.read_id)
             spans = chunk_read(len(x), enc.chunksize, enc.overlap)
             reads[rid] = (len(x), len(spans))
+            if rec.end_reason.reason.name in ("UNBLOCK_MUX_CHANGE", "MUX_CHANGE"):
+                mux.add(rid)
             for ci, (a, b) in enumerate(spans):
                 items.append((rid, ci, a, b - a, repeat_pad(x[a:b], enc.granularity)))
 
@@ -140,12 +164,14 @@ def main():
                 by_len.setdefault(f.shape[0], []).append((it, f))
             for group in by_len.values():
                 h = torch.stack([f for _, f in group])
-                for (it, _), (seq, moves) in zip(group, decode(head(h))):
-                    results[(it[0], it[1])] = (it[2], it[3], seq, moves)
+                for (it, _), (seq, qs, moves) in zip(group, decode(head(h))):
+                    results[(it[0], it[1])] = (it[2], it[3], seq, qs, moves)
 
     with open(args.out, "w") as f:
         for rid, (n, n_chunks) in reads.items():
-            seq = stitch([results[(rid, c)] for c in range(n_chunks)], n, enc.overlap)
+            seq, qs = stitch([results[(rid, c)] for c in range(n_chunks)], n, enc.overlap)
+            if qs is not None and rid in mux:
+                seq = mux_change_trim(seq, qs)
             if seq:
                 f.write(f">{rid}\n{seq}\n")
     print(f"{len(reads)} reads, {len(items)} chunks -> {args.out}")
