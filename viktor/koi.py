@@ -46,22 +46,29 @@ def load_extension():
     return _ext
 
 
-class KoiTxStack:
-    """Replaces encoder.transformer_encoder; built from its (fp16, CUDA) weights."""
+class KoiVcsEncoder:
+    """Dorado's variable-chunk-size encoder path (conv stack + transformer) on koi, from the
+    (fp16, CUDA) weights of a DoradoEncoder."""
 
-    def __init__(self, transformer_encoder, nhead, dim_feedforward, attn_window, theta=10000.0,
-                 max_seq_len=4096, use_i8=True, remove_bits=4, swiglu_f32_accum=False):
+    def __init__(self, encoder, use_i8=True, remove_bits=4):
         ext = load_extension()
+        lay = encoder.tx_layer
+        convs, params = [], []
+        for c in encoder.conv:
+            convs.append([c.conv.weight.detach().half().contiguous(), c.conv.bias.detach().half().contiguous()])
+            params.append([c.conv.kernel_size[0], c.conv.stride[0]])
         layers, alphas = [], []
-        for layer in transformer_encoder:
+        for layer in encoder.transformer_encoder:
             a, f = layer.self_attn, layer.ff
             layers.append([t.detach().half().contiguous() for t in (
                 a.Wqkv.weight, a.out_proj.weight, a.out_proj.bias, layer.norm1.weight,
                 layer.norm2.weight, f.fc1.weight, f.fc2.weight)])
             alphas.append(float(layer.deepnorm_alpha))
-        self.stack = ext.KoiTxStack(layers, alphas, nhead, dim_feedforward, int(attn_window[0]),
-                                    int(attn_window[1]), float(theta), int(max_seq_len), use_i8,
-                                    int(remove_bits), bool(swiglu_f32_accum))
+        self.enc = ext.KoiVcsEncoder(convs, params, layers, alphas, lay["nhead"], lay["dim_feedforward"],
+                                     float(lay.get("theta", 10000.0)), int(lay.get("max_seq_len", 4096)),
+                                     int(encoder.chunksize), use_i8, int(remove_bits))
+        self.granularity = self.enc.granularity()
 
-    def __call__(self, x):
-        return self.stack.forward(x.half().contiguous())
+    def __call__(self, signal, lens):
+        """signal: 1D fp16 CUDA (chunks concatenated), lens: samples per chunk -> frames [sum/stride, C]."""
+        return self.enc.forward(signal.half().contiguous(), [int(n) for n in lens])

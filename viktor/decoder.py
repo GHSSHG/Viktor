@@ -2,7 +2,9 @@
 
 Two call modes share the same weights:
   * full causal pass over [signal prefix | tokens] (training and prefill; optionally writes the KV cache)
-  * single-token step against a static KV cache (decode; CUDA-graph capturable)
+  * single-token step against a static KV cache, each sequence at its own position (decode)
+This is the reference / training implementation; fast_decoder.py runs the same weights on
+fused Triton kernels for inference.
 """
 
 from dataclasses import dataclass
@@ -85,10 +87,11 @@ class Attention(nn.Module):
         if _use_flash(q):
             # writes k/v at index seqlens in place and attends to positions [0, seqlens]
             return flash_attn_with_kvcache(q, kc, vc, k=k, v=v, cache_seqlens=seqlens, causal=True)
-        kc.index_copy_(1, pos, k)
-        vc.index_copy_(1, pos, v)
+        rows = torch.arange(kc.shape[0], device=kc.device)
+        kc[rows, pos] = k[:, 0]
+        vc[rows, pos] = v[:, 0]
         rep = self.h // self.hkv
-        mask = (cache.positions <= pos)[None]
+        mask = (cache.positions[None, :] <= pos[:, None])[:, None, None, :]
         return F.scaled_dot_product_attention(
             q.transpose(1, 2), kc.transpose(1, 2).repeat_interleave(rep, 1),
             vc.transpose(1, 2).repeat_interleave(rep, 1), attn_mask=mask).transpose(1, 2)
@@ -122,12 +125,13 @@ class Decoder(nn.Module):
         self.register_buffer("sin", sin, persistent=False)
 
     def forward(self, x, cache: Optional[KVCache] = None, batch_slice=slice(None), pos=None, seqlens=None):
-        """x: [B, T, d] input embeddings. pos (shape [1]) selects single-step decode mode.
-        Returns final-normed hidden states; apply `head` for logits."""
+        """x: [B, T, d] input embeddings. pos ([B], position of each sequence's token) selects
+        single-token decode mode, with seqlens = pos as int32. Returns final-normed hidden states;
+        apply `head` for logits."""
         if pos is None:
             cos, sin = self.cos[:x.shape[1]], self.sin[:x.shape[1]]
         else:
-            cos, sin = self.cos.index_select(0, pos), self.sin.index_select(0, pos)
+            cos, sin = self.cos[pos][:, None], self.sin[pos][:, None]
         for i, layer in enumerate(self.layers):
             x = layer(x, cos, sin, i, cache, batch_slice, pos, seqlens)
         return self.norm(x)

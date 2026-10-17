@@ -24,28 +24,11 @@ else:
     import tomli as tomllib
 
 from viktor import load_dorado_encoder
+from viktor.chunking import chunk_read, repeat_pad
 from viktor.encoder import _load_tensor
 
 STRIDE, NB, NS = 6, 4, 4 ** 5
-GRANULARITY = 768  # stride_inner (12) * 64
-BATCH = 256
-
-
-def chunk_read(n, size, overlap):
-    """generate_variable_chunks_tx: full chunks every size - overlap, then the remainder."""
-    out, off = [], 0
-    while off + size < n:
-        out.append((off, off + size))
-        off += size - overlap
-    if off != n:
-        out.append((off, n))
-    return out
-
-
-def repeat_pad(x, unit):
-    while len(x) % unit:
-        x = np.concatenate([x, x[:unit - len(x) % unit]])
-    return x
+BATCH = 512  # chunks per encoder batch, mixed lengths as in Dorado's VCS path
 
 
 class CRFHead(torch.nn.Module):
@@ -144,20 +127,20 @@ def main():
             spans = chunk_read(len(x), enc.chunksize, enc.overlap)
             reads[rid] = (len(x), len(spans))
             for ci, (a, b) in enumerate(spans):
-                items.append((rid, ci, a, b - a, repeat_pad(x[a:b], GRANULARITY)))
+                items.append((rid, ci, a, b - a, repeat_pad(x[a:b], enc.granularity)))
 
     results = {}
-    by_len = {}
-    for it in items:
-        by_len.setdefault(len(it[4]), []).append(it)
     with torch.no_grad():
-        for L, group in sorted(by_len.items()):
-            for i in range(0, len(group), BATCH):
-                g = group[i:i + BATCH]
-                n_pad = -(-len(g) // 64) * 64  # koi batch granularity; extra rows are copies, discarded
-                sig = np.stack([it[4] for it in g] + [g[0][4]] * (n_pad - len(g)))
-                h = enc(torch.from_numpy(sig).to(dev, torch.float16)[:, None])
-                for it, (seq, moves) in zip(g, decode(head(h)[:len(g)])):
+        for i in range(0, len(items), BATCH):
+            g = items[i:i + BATCH]
+            sig = torch.from_numpy(np.concatenate([it[4] for it in g])).to(dev, torch.float16)
+            frames = enc.forward_varlen(sig, [len(it[4]) for it in g]).split([len(it[4]) // enc.stride for it in g])
+            by_len = {}
+            for it, f in zip(g, frames):
+                by_len.setdefault(f.shape[0], []).append((it, f))
+            for group in by_len.values():
+                h = torch.stack([f for _, f in group])
+                for (it, _), (seq, moves) in zip(group, decode(head(h))):
                     results[(it[0], it[1])] = (it[2], it[3], seq, moves)
 
     with open(args.out, "w") as f:

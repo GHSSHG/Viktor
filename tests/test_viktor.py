@@ -17,7 +17,7 @@ TINY_CFG = {
             {"type": "permute", "dims": [0, 2, 1]}]},
         "transformer_encoder": {"depth": 2, "layer": {
             "d_model": 32, "nhead": 4, "dim_feedforward": 64, "deepnorm_alpha": 2.0, "attn_window": [7, 8]}}}},
-    "basecaller": {"chunksize": 256, "overlap": 16},
+    "basecaller": {"chunksize": 512, "overlap": 16},
 }
 
 
@@ -29,13 +29,13 @@ def tiny_model(k, seed=0):
     return Basecaller(DoradoEncoder(TINY_CFG), tok, cfg).eval()
 
 
-def greedy_reference(model, frames, max_new):
-    """Recompute the whole sequence every step, no cache."""
+def greedy_reference(model, frames_list, max_new):
+    """Recompute the whole sequence every step, no cache; one prefix per sequence."""
     eng_bias = torch.zeros(model.tokenizer.vocab_size)
     eng_bias[[PAD, BOS]] = float("-inf")
-    prefix = model.projector(frames)
     out = []
-    for b in range(frames.shape[0]):
+    for frames in frames_list:
+        prefix = model.projector(frames)[None]
         toks, prev = [], BOS
         for _ in range(max_new):
             if prev in (EOS, PAD):
@@ -43,14 +43,14 @@ def greedy_reference(model, frames, max_new):
             elif model.tokenizer.tail_mask[prev]:
                 nxt = EOS
             else:
-                x = torch.cat([prefix[b:b + 1], model.decoder.embed(torch.tensor([[BOS] + toks]))], 1)
+                x = torch.cat([prefix, model.decoder.embed(torch.tensor([[BOS] + toks]))], 1)
                 logits = model.decoder.head(model.decoder(x)[:, -1])[0]
                 nxt = int((logits + eng_bias).argmax())
             if nxt not in (EOS, PAD):
                 toks.append(nxt)
             out.append(nxt)
             prev = nxt
-    return torch.tensor(out).view(frames.shape[0], max_new)
+    return torch.tensor(out).view(len(frames_list), max_new)
 
 
 @pytest.mark.parametrize("k", [1, 4])
@@ -68,23 +68,37 @@ def test_tokenizer_roundtrip(k):
 
 
 @pytest.mark.parametrize("k", [1, 4])
-def test_engine_matches_full_recompute(k):
+def test_engine_varlen_matches_full_recompute(k):
     model = tiny_model(k)
+    lens = [256, 512, 256]  # multiples of the tiny granularity (stride 4 * 64)
     with torch.no_grad():
-        frames = model.encoder(torch.randn(3, 1, 256))
-        eng = DecodeEngine(model, 3, 20, frames.shape[1], prefill_batch=2)
-        got = eng.generate(frames).clone()
-        ref = greedy_reference(model, frames, 20)
+        sig = torch.randn(sum(lens))
+        frames = model.encoder.forward_varlen(sig, lens)
+        flens = [n // model.encoder.stride for n in lens]
+        assert frames.shape[0] == sum(flens)
+        eng = DecodeEngine(model, 3, 20, max(flens), backend="torch", prefill_batch=2)
+        got = eng.generate(frames, flens).clone()
+        ref = greedy_reference(model, list(frames.split(flens)), 20)
     assert torch.equal(got, ref)
+
+
+def test_encoder_varlen_is_per_chunk():
+    model = tiny_model(1)
+    lens = [512, 256]
+    with torch.no_grad():
+        sig = torch.randn(sum(lens))
+        packed = model.encoder.forward_varlen(sig, lens)
+        alone = torch.cat([model.encoder(sig[:512].view(1, 1, -1))[0], model.encoder(sig[512:].view(1, 1, -1))[0]])
+    assert torch.allclose(packed, alone)
 
 
 def test_pipeline_matches_sequential():
     model = tiny_model(4)
-    signals = [torch.randn(2, 1, 256) for _ in range(3)]
-    eng = DecodeEngine(model, 2, 12, 64)
+    batches = [(torch.randn(768), [256, 512]) for _ in range(3)]
+    eng = DecodeEngine(model, 2, 12, 128, backend="torch")
     pipe = Pipeline(model, eng)
-    a = pipe.run(signals, overlap=True)
-    b = pipe.run(signals, overlap=False)
+    a = pipe.run(batches, overlap=True)
+    b = pipe.run(batches, overlap=False)
     assert all(torch.equal(x, y) for x, y in zip(a, b))
 
 

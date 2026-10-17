@@ -129,25 +129,38 @@ class DoradoEncoder(nn.Module):
         std = cfg.get("standardisation", {})
         self.mean, self.stdev = std.get("mean", 0.0), std.get("stdev", 1.0)
         self.chunksize = cfg["basecaller"]["chunksize"]
+        self.granularity = self.stride * 64  # Dorado chunk_size_granularity()
         self.overlap = cfg["basecaller"]["overlap"]
 
     def standardise(self, pa):
         return (pa - self.mean) / self.stdev
 
     def use_koi(self, **kw):
-        """Run the transformer stack on Dorado's koi kernels (CUDA, inference only).
+        """Run the encoder on Dorado's koi kernels, variable-chunk-size path (CUDA, inference only).
         Call after moving the encoder to CUDA; the PyTorch layers stay as the weight source."""
-        from .koi import KoiTxStack
-        lay = self.tx_layer
-        self.koi = KoiTxStack(self.transformer_encoder, lay["nhead"], lay["dim_feedforward"], lay["attn_window"],
-                              lay.get("theta", 10000.0), lay.get("max_seq_len", 4096), **kw)
+        from .koi import KoiVcsEncoder
+        self.koi = KoiVcsEncoder(self, **kw)
         return self
 
     def forward(self, x):
-        h = self.conv(x).transpose(1, 2)
+        """x [N, 1, T] -> frames [N, T / stride, d_model]."""
         if self.koi is not None:
-            return self.koi(h)
-        return self.transformer_encoder(h)
+            n, _, t = x.shape
+            return self.koi(x.reshape(-1), [t] * n).view(n, t // self.stride, -1)
+        return self.transformer_encoder(self.conv(x).transpose(1, 2))
+
+    def forward_varlen(self, signal, lens):
+        """Variable-length chunks as in Dorado's VCS path: each chunk is encoded independently
+        (zero-padded convolutions, attention and RoPE positions within the chunk).
+        signal: 1D (chunks concatenated), lens: samples per chunk, multiples of granularity.
+        Returns frames [sum(lens) / stride, d_model], chunks in order."""
+        if self.koi is not None:
+            return self.koi(signal, lens)
+        out, off = [], 0
+        for n in lens:
+            out.append(self.forward(signal[off:off + n].view(1, 1, n))[0])
+            off += n
+        return torch.cat(out)
 
 
 def _load_tensor(path):

@@ -1,10 +1,13 @@
-"""Cut full Dorado-size chunks from a pod5 file into a .npy for benchmarking.
+"""Cut Dorado-style chunks from a pod5 file into an .npz for benchmarking.
 
-Signal is converted to pA and standardised with the Dorado model's mean/stdev, then cut into
-chunksize windows with step chunksize - overlap (as Dorado does for long reads).
+Signal is converted to pA and standardised with the model's mean/stdev, then chunked as Dorado's
+variable-chunk-size path does (full chunks + a shorter, repeat-padded last chunk per read).
+--full-only keeps only full-size chunks. The .npz holds:
+  signal  fp16, all chunks concatenated      lens  samples per chunk
+  new     new (non-overlap, non-padding) samples per chunk, for throughput accounting
 
 Example:
-  python scripts/make_chunks.py --pod5 READS.pod5 --model-dir MODEL --n 2048 --out results/chunks_2048.npy
+  python scripts/make_chunks.py --pod5 READS.pod5 --model-dir MODEL --n 2048 --out results/chunks_vcs_2048.npz
 """
 
 import argparse
@@ -13,6 +16,8 @@ import sys
 
 import numpy as np
 import pod5
+
+from viktor.chunking import chunk_read, repeat_pad
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -25,6 +30,7 @@ def main():
     ap.add_argument("--pod5", required=True)
     ap.add_argument("--model-dir", required=True)
     ap.add_argument("--n", type=int, default=2048)
+    ap.add_argument("--full-only", action="store_true")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -32,22 +38,30 @@ def main():
         cfg = tomllib.load(f)
     size, overlap = cfg["basecaller"]["chunksize"], cfg["basecaller"]["overlap"]
     mean, stdev = cfg["standardisation"]["mean"], cfg["standardisation"]["stdev"]
+    stride = 1
+    for l in cfg["model"]["encoder"]["conv"]["sublayers"]:
+        stride *= l.get("stride", 1)
+    granularity = stride * 64
 
-    chunks = []
+    chunks, new = [], []
     with pod5.Reader(args.pod5) as reader:
         for rec in reader.reads():
             x = (rec.signal_pa.astype(np.float32) - mean) / stdev
-            for start in range(0, len(x) - size + 1, size - overlap):
-                chunks.append(x[start:start + size])
+            for i, (a, b) in enumerate(chunk_read(len(x), size, overlap)):
+                if args.full_only and b - a != size:
+                    continue
+                chunks.append(repeat_pad(x[a:b], granularity))
+                new.append((b - a) - (overlap if i else 0))
                 if len(chunks) == args.n:
                     break
             if len(chunks) == args.n:
                 break
     if len(chunks) < args.n:
-        sys.exit(f"only {len(chunks)} full chunks in {args.pod5}")
+        sys.exit(f"only {len(chunks)} chunks in {args.pod5}")
+    lens = np.array([len(c) for c in chunks], dtype=np.int64)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-    np.save(args.out, np.stack(chunks).astype(np.float16))
-    print(f"saved {args.n} x {size} to {args.out}")
+    np.savez(args.out, signal=np.concatenate(chunks).astype(np.float16), lens=lens, new=np.array(new))
+    print(f"saved {args.n} chunks ({(lens == size).sum()} full, {(lens < size).sum()} shorter) to {args.out}")
 
 
 if __name__ == "__main__":

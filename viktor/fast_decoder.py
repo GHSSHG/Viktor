@@ -1,0 +1,53 @@
+"""Inference forward of the Decoder on the fused Triton kernels (same weights as decoder.Decoder).
+
+Tokens are packed [n_tokens, d]: prefill packs the prefixes of many variable-length chunks
+(flash_attn_varlen_func), a decode step is one token per sequence (flash_attn_with_kvcache).
+The matmuls stay on cuBLAS.
+"""
+
+import torch
+import torch.nn.functional as F
+from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+
+from .decoder import Decoder, KVCache
+from .triton_ops import add_rmsnorm, qkv_rope_cache, swiglu
+
+
+class FastDecoder:
+    def __init__(self, dec: Decoder):
+        cfg = dec.cfg
+        assert all(n & (n - 1) == 0 for n in (cfg.n_heads, cfg.n_kv_heads, cfg.head_dim // 2)), \
+            "kernels need power-of-two head counts and head_dim / 2"
+        self.dec, self.cfg = dec, cfg
+
+    def _layers(self, x, pos, seq, cache: KVCache, attend, return_kv):
+        """x [n, d] residual stream (modified in place). Returns the final-normed hidden [n, d]."""
+        cfg, layers = self.cfg, self.dec.layers
+        h = add_rmsnorm(x, layers[0].attn_norm.weight, cfg.norm_eps)
+        for i, blk in enumerate(layers):
+            a = blk.attn
+            qkv = F.linear(h, a.qkv_proj.weight)
+            r = qkv_rope_cache(qkv, a.q_norm.weight, a.k_norm.weight, self.dec.cos, self.dec.sin, pos, seq,
+                               cache.k[i], cache.v[i], cfg.norm_eps, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim,
+                               return_kv=return_kv)
+            o = attend(i, r)
+            h = add_rmsnorm(x, blk.mlp_norm.weight, cfg.norm_eps, delta=F.linear(o.reshape(x.shape[0], -1),
+                                                                                    a.o_proj.weight))
+            m = F.linear(swiglu(F.linear(h, blk.gate_up.weight)), blk.down.weight)
+            w_next = layers[i + 1].attn_norm.weight if i + 1 < len(layers) else self.dec.norm.weight
+            h = add_rmsnorm(x, w_next, cfg.norm_eps, delta=m)
+        return h
+
+    def prefill(self, x, pos, seq, cu_seqlens, max_seqlen, cache: KVCache):
+        """x [n, d] packed prefix embeddings of several sequences; pos/seq [n] int32; cu_seqlens [b+1] int32.
+        Fills the cache rows of those sequences; returns hidden [n, d]."""
+        def attend(i, r):
+            q, k, v = r
+            return flash_attn_varlen_func(q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, causal=True)
+        return self._layers(x, pos, seq, cache, attend, return_kv=True)
+
+    def decode(self, x, pos, seq, cache_seqlens, cache: KVCache):
+        """One token per sequence: x [B, d], pos/seq [B] int32, cache_seqlens = pos + 1 (int32)."""
+        def attend(i, q):
+            return flash_attn_with_kvcache(q[:, None], cache.k[i], cache.v[i], cache_seqlens=cache_seqlens)[:, 0]
+        return self._layers(x, pos, seq, cache, attend, return_kv=False)
