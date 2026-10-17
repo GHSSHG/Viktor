@@ -10,6 +10,7 @@ dependencies = [
 
 [project.optional-dependencies]
 flash = ["flash-attn>=2.5"]
+data = ["pod5", "numpy"]
 dev = ["pytest"]
 
 [build-system]

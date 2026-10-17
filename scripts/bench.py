@@ -12,6 +12,7 @@ import argparse
 import json
 import time
 
+import numpy as np
 import torch
 
 from viktor import Basecaller, DecodeEngine, Pipeline, get_tokenizer, load_dorado_encoder
@@ -36,7 +37,8 @@ def main():
     ap.add_argument("--tokenizer", choices=["base", "4mer"], required=True)
     ap.add_argument("--batch", type=int, default=512)
     ap.add_argument("--steps", type=int, default=None, help="output tokens per chunk (default: base 984, 4mer 247)")
-    ap.add_argument("--batches", type=int, default=6, help="batches per timed run")
+    ap.add_argument("--batches", type=int, default=6, help="batches per timed run (random signal)")
+    ap.add_argument("--signals", default=None, help=".npy [N, chunksize] from make_chunks.py; batches = N // batch")
     ap.add_argument("--enc-dtype", choices=DTYPES, default="fp16")
     ap.add_argument("--dec-dtype", choices=DTYPES, default="bf16")
     ap.add_argument("--prefill-batch", type=int, default=128)
@@ -56,8 +58,14 @@ def main():
     chunk = encoder.chunksize
     n_frames = chunk // encoder.stride
     bases_per_chunk = (chunk - encoder.overlap) / 12.5
-    sig = torch.randn(args.batch, 1, chunk, device=dev, dtype=DTYPES[args.enc_dtype])
-    signals = [sig] * args.batches
+    if args.signals:
+        x = torch.from_numpy(np.load(args.signals)).to(dev, DTYPES[args.enc_dtype])
+        assert x.shape[1] == chunk and x.shape[0] >= args.batch
+        signals = [x[i:i + args.batch, None] for i in range(0, x.shape[0] - args.batch + 1, args.batch)]
+        args.batches = len(signals)
+    else:
+        signals = [torch.randn(args.batch, 1, chunk, device=dev, dtype=DTYPES[args.enc_dtype])] * args.batches
+    sig = signals[0]
 
     torch.cuda.reset_peak_memory_stats()
     engine = DecodeEngine(model, args.batch, steps, n_frames, cuda_graph=not args.no_graph,
@@ -78,7 +86,7 @@ def main():
     res = {
         "gpu": torch.cuda.get_device_name(), "torch": torch.__version__,
         "flash_attn": enc_mod.flash_attn_func is not None,
-        "tokenizer": args.tokenizer, "batch": B, "steps": steps, "enc_dtype": args.enc_dtype,
+        "signals": args.signals or "random", "tokenizer": args.tokenizer, "batch": B, "steps": steps, "enc_dtype": args.enc_dtype,
         "dec_dtype": args.dec_dtype, "cuda_graph": not args.no_graph, "compile": args.compile,
         "ms_per_chunk": {k: round(v / B * 1e3, 4) for k, v in
                          {"encoder": t_enc, "prefill": t_pre, "decode": t_dec,
