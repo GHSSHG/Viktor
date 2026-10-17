@@ -55,7 +55,9 @@ def main():
     frames = encoder.forward_varlen(signal, lens)
     enc_ms, _ = measure(lambda: encoder.forward_varlen(signal, lens), reps=args.reps)
     for variant in args.variants.split(","):
-        eng = DecodeEngine(model, 256, steps, max(flens), attention_backend=variant)
+        parts = variant.split(":")
+        eng = DecodeEngine(model, 256, steps, max(flens), attention_backend=parts[0],
+                           prefill_mode=parts[1] if len(parts) > 1 else "full")
         eng.generate(frames, flens, steps)
         torch.cuda.reset_peak_memory_stats()
         pre, pre_samples = measure(lambda: eng.prefill(frames, flens), reps=args.reps)

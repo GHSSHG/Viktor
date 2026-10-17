@@ -26,7 +26,7 @@ def _triton_available():
 class DecodeEngine:
     def __init__(self, model: Basecaller, batch_size: int, max_new_tokens: int, max_frames: int,
                  backend: str = "auto", cuda_graph: bool = True, prefill_batch: int = 128, check_every: int = 32,
-                 attention_backend: str = "flash"):
+                 attention_backend: str = "flash", prefill_mode: str = "full"):
         self.model, self.dec = model, model.decoder
         dev = self.dec.lm_head.weight.device
         self.dtype = self.dec.lm_head.weight.dtype
@@ -38,6 +38,10 @@ class DecodeEngine:
             self.fast = FastDecoder(self.dec, attention_backend=attention_backend)
         self.B, self.max_new = batch_size, max_new_tokens
         self.prefill_batch, self.check_every = prefill_batch, check_every
+        if prefill_mode not in ("full", "last"):
+            raise ValueError(f"unknown prefill mode: {prefill_mode}")
+        self.prefill_mode = prefill_mode
+        self._prefill_plans = {}
         max_len = max_frames + 1 + max_new_tokens
         assert max_len <= self.dec.cfg.max_seq_len
         self.cache = KVCache(self.dec.cfg, batch_size, max_len, self.dtype, dev)
@@ -101,6 +105,33 @@ class DecodeEngine:
         """prefix [sum(lens), d] projected frames of sequences row0.. ; returns hidden at each BOS."""
         dev = prefix.device
         n = len(lens)
+        if self.prefill_mode == "last":
+            # One layout per subbatch, replaced when its lengths change. Sizes
+            # come from CPU metadata, so construction never reads GPU scalars.
+            key = tuple(lens)
+            entry = self._prefill_plans.get(row0)
+            if entry is None or entry[0] != key:
+                offsets = [0]
+                for length in lens:
+                    offsets.append(offsets[-1] + length + 1)
+                total, frames = offsets[-1], sum(lens)
+                cu = torch.tensor(offsets, dtype=torch.int32, device=dev)
+                L = torch.tensor(lens, device=dev)
+                frame_seg = torch.repeat_interleave(torch.arange(n, device=dev), L, output_size=frames)
+                frame_idx = torch.arange(frames, device=dev) + frame_seg
+                last = cu[1:].long() - 1
+                pos = (torch.arange(total, device=dev) - torch.repeat_interleave(cu[:-1].long(), L + 1,
+                                                                               output_size=total)).int()
+                seq = torch.repeat_interleave(torch.arange(row0, row0 + n, device=dev, dtype=torch.int32),
+                                              L + 1, output_size=total)
+                cuq = torch.arange(n + 1, device=dev, dtype=torch.int32)
+                entry = key, (frame_idx, last, pos, seq, cu, cuq, total, max(lens) + 1)
+                self._prefill_plans[row0] = entry
+            frame_idx, last, pos, seq, cu, cuq, total, max_len = entry[1]
+            x = torch.empty(total, prefix.shape[1], dtype=self.dtype, device=dev)
+            x[frame_idx] = prefix
+            x[last] = self.dec.embed(self.bos).to(self.dtype)
+            return self.fast.prefill(x, pos, seq, cu, max_len, self.cache, last_indices=last, cu_queries=cuq)
         L = torch.tensor(lens, device=dev)
         seq_len = L + 1
         cu = torch.zeros(n + 1, dtype=torch.int32, device=dev)
