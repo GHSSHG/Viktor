@@ -113,7 +113,8 @@ def _swiglu_kernel(gu_ptr, out_ptr, F, BLOCK: tl.constexpr):
     m = cols < F
     g = tl.load(gu_ptr + row * 2 * F + cols, mask=m, other=0.0).to(tl.float32)
     u = tl.load(gu_ptr + row * 2 * F + F + cols, mask=m, other=0.0).to(tl.float32)
-    tl.store(out_ptr + row * F + cols, (g * tl.sigmoid(g) * u).to(out_ptr.dtype.element_ty), mask=m)
+    act = (g * tl.sigmoid(g)).to(out_ptr.dtype.element_ty).to(tl.float32)  # F.silu output is stored, as in torch
+    tl.store(out_ptr + row * F + cols, (act * u).to(out_ptr.dtype.element_ty), mask=m)
 
 
 def swiglu(gu):
