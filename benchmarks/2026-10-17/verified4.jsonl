@@ -1,0 +1,1 @@
+{"status": "passed", "backend": "auto", "tokenizer": "4mer", "batch": 256, "steps": 247, "prefill_token_agreement": 1.0, "teacher_forced_max_logit_error": 0.03125, "prefill_max_logit_error": 0.0078125, "cache_exact": true, "graph_eager_exact": true}
