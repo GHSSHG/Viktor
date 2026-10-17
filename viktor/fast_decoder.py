@@ -14,11 +14,14 @@ from .triton_ops import add_rmsnorm, qkv_rope_cache, swiglu
 
 
 class FastDecoder:
-    def __init__(self, dec: Decoder):
+    def __init__(self, dec: Decoder, attention_backend="flash"):
         cfg = dec.cfg
         assert all(n & (n - 1) == 0 for n in (cfg.n_heads, cfg.n_kv_heads, cfg.head_dim // 2)), \
             "kernels need power-of-two head counts and head_dim / 2"
         self.dec, self.cfg = dec, cfg
+        if attention_backend not in ("flash", "split", "split2", "split4"):
+            raise ValueError(f"unknown decode attention backend: {attention_backend}")
+        self.attention_backend = attention_backend
 
     def _layers(self, x, pos, seq, cache: KVCache, attend, return_kv):
         """x [n, d] residual stream (modified in place). Returns the final-normed hidden [n, d]."""
@@ -49,5 +52,13 @@ class FastDecoder:
     def decode(self, x, pos, seq, cache_seqlens, cache: KVCache):
         """One token per sequence: x [B, d], pos/seq [B] int32, cache_seqlens = pos + 1 (int32)."""
         def attend(i, q):
-            return flash_attn_with_kvcache(q[:, None], cache.k[i], cache.v[i], cache_seqlens=cache_seqlens)[:, 0]
+            kw = {}
+            if self.attention_backend == "split":
+                # FA2 otherwise dispatches to the general forward kernel when K/V
+                # have already been written. Identity indices select its decode kernel.
+                kw = dict(cache_batch_idx=seq, num_splits=1)
+            elif self.attention_backend.startswith("split"):
+                kw = dict(num_splits=int(self.attention_backend[5:]))
+            return flash_attn_with_kvcache(q[:, None], cache.k[i], cache.v[i],
+                                          cache_seqlens=cache_seqlens, **kw)[:, 0]
         return self._layers(x, pos, seq, cache, attend, return_kv=False)
