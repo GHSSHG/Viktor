@@ -1,0 +1,106 @@
+import os
+import random
+
+import pytest
+import torch
+
+from viktor import (BOS, EOS, PAD, Basecaller, DecodeEngine, DecoderConfig, DoradoEncoder, Pipeline,
+                    KmerTokenizer, load_dorado_encoder)
+
+MODEL_DIR = os.environ.get("VIKTOR_DORADO_MODEL")
+
+TINY_CFG = {
+    "model": {"encoder": {
+        "conv": {"sublayers": [
+            {"type": "convolution", "insize": 1, "size": 16, "winlen": 5, "stride": 1, "padding": 2, "bias": True},
+            {"type": "convolution", "insize": 16, "size": 32, "winlen": 9, "stride": 4, "padding": 4, "bias": True},
+            {"type": "permute", "dims": [0, 2, 1]}]},
+        "transformer_encoder": {"depth": 2, "layer": {
+            "d_model": 32, "nhead": 4, "dim_feedforward": 64, "deepnorm_alpha": 2.0, "attn_window": [7, 8]}}}},
+    "basecaller": {"chunksize": 256, "overlap": 16},
+}
+
+
+def tiny_model(k, seed=0):
+    torch.manual_seed(seed)
+    tok = KmerTokenizer(k)
+    cfg = DecoderConfig(vocab_size=tok.vocab_size, d_model=32, n_layers=2, n_heads=4, n_kv_heads=2,
+                        head_dim=8, ffn_dim=64, max_seq_len=512)
+    return Basecaller(DoradoEncoder(TINY_CFG), tok, cfg).eval()
+
+
+def greedy_reference(model, frames, max_new):
+    """Recompute the whole sequence every step, no cache."""
+    eng_bias = torch.zeros(model.tokenizer.vocab_size)
+    eng_bias[[PAD, BOS]] = float("-inf")
+    prefix = model.projector(frames)
+    out = []
+    for b in range(frames.shape[0]):
+        toks, prev = [], BOS
+        for _ in range(max_new):
+            if prev in (EOS, PAD):
+                nxt = PAD
+            elif model.tokenizer.tail_mask[prev]:
+                nxt = EOS
+            else:
+                x = torch.cat([prefix[b:b + 1], model.decoder.embed(torch.tensor([[BOS] + toks]))], 1)
+                logits = model.decoder.head(model.decoder(x)[:, -1])[0]
+                nxt = int((logits + eng_bias).argmax())
+            if nxt not in (EOS, PAD):
+                toks.append(nxt)
+            out.append(nxt)
+            prev = nxt
+    return torch.tensor(out).view(frames.shape[0], max_new)
+
+
+@pytest.mark.parametrize("k", [1, 4])
+def test_tokenizer_roundtrip(k):
+    tok = KmerTokenizer(k)
+    assert tok.vocab_size == 3 + sum(4 ** j for j in range(1, k + 1))
+    rng = random.Random(k)
+    for n in range(0, 23):
+        s = "".join(rng.choice("ACGT") for _ in range(n))
+        ids = tok.encode(s)
+        assert len(ids) == -(-n // k)
+        assert not any(tok.tail_mask[i] for i in ids[:-1])
+        assert tok.decode(ids + [EOS, 5]) == s
+        assert int(tok.n_bases[ids].sum()) == n
+
+
+@pytest.mark.parametrize("k", [1, 4])
+def test_engine_matches_full_recompute(k):
+    model = tiny_model(k)
+    with torch.no_grad():
+        frames = model.encoder(torch.randn(3, 1, 256))
+        eng = DecodeEngine(model, 3, 20, frames.shape[1], prefill_batch=2)
+        got = eng.generate(frames).clone()
+        ref = greedy_reference(model, frames, 20)
+    assert torch.equal(got, ref)
+
+
+def test_pipeline_matches_sequential():
+    model = tiny_model(4)
+    signals = [torch.randn(2, 1, 256) for _ in range(3)]
+    eng = DecodeEngine(model, 2, 12, 64)
+    pipe = Pipeline(model, eng)
+    a = pipe.run(signals, overlap=True)
+    b = pipe.run(signals, overlap=False)
+    assert all(torch.equal(x, y) for x, y in zip(a, b))
+
+
+def test_loss_backward_and_freeze():
+    model = tiny_model(4).train()
+    model.set_encoder_trainable(False)
+    loss = model.loss(torch.randn(2, 1, 256), ["ACGTACGTA", "TTGCA"])
+    loss.backward()
+    assert all(p.grad is None for p in model.encoder.parameters())
+    assert model.decoder.lm_head.weight.grad is not None
+
+
+@pytest.mark.skipif(MODEL_DIR is None, reason="set VIKTOR_DORADO_MODEL to a Dorado SUP model dir")
+def test_load_dorado_weights():
+    enc = load_dorado_encoder(MODEL_DIR).eval()
+    assert enc.stride == 12 and enc.d_model == 512
+    with torch.no_grad():
+        y = enc(torch.randn(1, 1, enc.chunksize))
+    assert y.shape == (1, enc.chunksize // 12, 512) and torch.isfinite(y).all()
