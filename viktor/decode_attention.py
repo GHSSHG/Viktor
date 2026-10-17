@@ -63,7 +63,7 @@ def _combine(pp, lp, op, H: tl.constexpr, HK: tl.constexpr, D: tl.constexpr,
     tl.store(op + (b * H + h) * D + d, out)
 
 
-def decode_attention(q, k, v, lengths, block=128, splits=1):
+def decode_attention(q, k, v, lengths, block=64, splits=1, warps=4):
     """q [B,H,D], KV [B,S,Hkv,D], lengths [B] int32 (includes current token)."""
     B, H, D = q.shape
     HK = k.shape[2]
@@ -75,7 +75,7 @@ def decode_attention(q, k, v, lengths, block=128, splits=1):
     partial = out if splits == 1 else torch.empty((B, HK, splits, H // HK, D), device=q.device, dtype=torch.float32)
     lse = out if splits == 1 else torch.empty((B, HK, splits, H // HK), device=q.device, dtype=torch.float32)
     _decode[(B, HK, splits)](q, k, v, lengths, partial, lse, k.stride(0), k.stride(1),
-                            H, HK, D, H // HK, block, splits, num_warps=4, num_stages=2)
+                            H, HK, D, H // HK, block, splits, num_warps=warps, num_stages=2)
     if splits > 1:
         _combine[(B, H)](partial, lse, out, H, HK, D, H // HK, splits, num_warps=4)
     return out

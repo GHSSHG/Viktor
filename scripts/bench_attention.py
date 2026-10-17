@@ -41,6 +41,7 @@ def main():
     ap.add_argument("--length", type=int, default=1271)
     ap.add_argument("--profile", action="store_true")
     ap.add_argument("--triton", action="store_true")
+    ap.add_argument("--tune-warps", action="store_true")
     args = ap.parse_args()
     torch.manual_seed(123)
     B, H, HK, D, S = 256, 8, 2, 64, args.length
@@ -69,6 +70,12 @@ def main():
                 for splits in (1, 2, 4):
                     variants[f"triton_{block}_{splits}"] = lambda block=block, splits=splits: decode_attention(
                         q[:, 0], k, v, lens, block=block, splits=splits)[:, None]
+        if args.tune_warps:
+            from viktor.decode_attention import decode_attention
+            for block in (64, 128, 256):
+                for warps in (2, 4, 8):
+                    variants[f"triton_{block}_w{warps}"] = lambda block=block, warps=warps: decode_attention(
+                        q[:, 0], k, v, lens, block=block, warps=warps)[:, None]
         mask = torch.arange(S, device="cuda")[None, :] < lens[:4, None]
         ref = F.scaled_dot_product_attention(q[:4].transpose(1, 2).float(),
             k[:4].transpose(1, 2).repeat_interleave(4, 1).float(),
