@@ -94,7 +94,10 @@ def main():
     cos = F.cosine_similarity(packed.float(), ref.float(), dim=1)
     report("koi VCS vs PyTorch encoder", cos.mean() > 0.95, f"per-frame cosine mean {cos.mean():.4f} min {cos.min():.4f}")
 
-    flens = [int(n) // enc.stride for n in lens]
+    frames, flens = enc.encode_chunks(sig, lens.tolist(), z["valid"][:args.n].tolist())
+    keep = np.concatenate([np.arange(s, s + f) for s, f in zip(np.cumsum([0] + [int(n) // enc.stride for n in lens[:-1]]), flens)])
+    report("decoder frames = real signal only", torch.equal(frames, packed[torch.from_numpy(keep).to(dev)]),
+           f"{packed.shape[0] - frames.shape[0]} padding frames dropped over {len(lens)} chunks")
     for name in ("4mer", "base"):
         torch.manual_seed(0)
         model = Basecaller(enc, get_tokenizer(name))
@@ -105,7 +108,7 @@ def main():
         outs, logits = {}, {}
         for backend, graph in (("torch", False), ("triton", False), ("triton", True)):
             eng = DecodeEngine(model, len(lens), steps, max(flens), backend=backend, cuda_graph=graph)
-            outs[(backend, graph)] = eng.generate(packed, flens, steps).clone()
+            outs[(backend, graph)] = eng.generate(frames, flens, steps).clone()
         agree = (outs[("triton", True)] == outs[("torch", False)]).float().mean()
         report(f"{name}: triton graph == triton eager", torch.equal(outs[("triton", True)], outs[("triton", False)]), "")
         report(f"{name}: triton vs torch greedy tokens", agree > 0.9, f"agreement {agree:.3f} over {steps} steps x {len(lens)} chunks")

@@ -54,7 +54,7 @@ def main():
     model.eval()
 
     z = np.load(args.chunks)
-    lens, new = z["lens"][:args.n_chunks], z["new"][:args.n_chunks]
+    lens, valid, new = z["lens"][:args.n_chunks], z["valid"][:args.n_chunks], z["new"][:args.n_chunks]
     sig = torch.from_numpy(z["signal"][:int(lens.sum())]).to(dev)
     offs = np.concatenate([[0], np.cumsum(lens)])
     n_batches = len(lens) // args.batch
@@ -63,8 +63,8 @@ def main():
     batches, steps, new_bases = [], [], 0.0
     for i in range(n_batches):
         a, b = i * args.batch, (i + 1) * args.batch
-        batches.append((sig[offs[a]:offs[b]], lens[a:b].tolist()))
-        steps.append(math.ceil(lens[a:b].max() / SAMPLES_PER_BASE / tok.k) + 1)
+        batches.append((sig[offs[a]:offs[b]], lens[a:b].tolist(), valid[a:b].tolist()))
+        steps.append(math.ceil(valid[a:b].max() / SAMPLES_PER_BASE / tok.k) + 1)
         new_bases += new[a:b].sum() / SAMPLES_PER_BASE
     n_chunks = n_batches * args.batch
 
@@ -75,10 +75,9 @@ def main():
     pipe = Pipeline(model, engine)
 
     with torch.no_grad():
-        frames = [encoder.forward_varlen(s, l) for s, l in batches]
-        flens = [[n // encoder.stride for n in l] for _, l in batches]
+        frames, flens = zip(*[encoder.encode_chunks(*b) for b in batches])
         pipe.run(batches[:2], steps[:2])  # warm-up
-        t_enc = timed(lambda: [encoder.forward_varlen(s, l) for s, l in batches])
+        t_enc = timed(lambda: [encoder.encode_chunks(*b) for b in batches])
         t_pre = timed(lambda: [engine.prefill(f, fl) for f, fl in zip(frames, flens)])
         t_all = timed(lambda: [engine.generate(f, fl, st) for f, fl, st in zip(frames, flens, steps)])
     t_seq = timed(lambda: pipe.run(batches, steps, overlap=False))

@@ -10,6 +10,7 @@ import glob
 import os
 import sys
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -161,6 +162,21 @@ class DoradoEncoder(nn.Module):
             out.append(self.forward(signal[off:off + n].view(1, 1, n))[0])
             off += n
         return torch.cat(out)
+
+    def encode_chunks(self, signal, lens, valid):
+        """Decoder input: forward_varlen on the repeat-padded chunks, then the frames past each chunk's
+        real signal are dropped (as Dorado keeps CRF frames only up to the real signal).
+        valid: real (unpadded) samples per chunk. Returns (frames [sum(frame_lens), d_model], frame_lens),
+        frame_lens = ceil(valid / stride)."""
+        frames = self.forward_varlen(signal, lens)
+        padded = [int(n) // self.stride for n in lens]
+        frame_lens = [-(-int(v) // self.stride) for v in valid]
+        assert all(0 < f <= p for f, p in zip(frame_lens, padded))
+        if frame_lens == padded:
+            return frames, frame_lens
+        starts = np.cumsum([0] + padded[:-1])
+        idx = np.concatenate([np.arange(s, s + f) for s, f in zip(starts, frame_lens)])
+        return frames.index_select(0, torch.from_numpy(idx).to(frames.device)), frame_lens
 
 
 def _load_tensor(path):

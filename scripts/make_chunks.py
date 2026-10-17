@@ -3,7 +3,8 @@
 Signal is scaled and trimmed as Dorado's ScalerNode does (viktor.chunking.dorado_scale), then chunked as Dorado's
 variable-chunk-size path does (full chunks + a shorter, repeat-padded last chunk per read).
 --full-only keeps only full-size chunks. The .npz holds:
-  signal  fp16, all chunks concatenated      lens  samples per chunk
+  signal  fp16, all chunks concatenated      lens  samples per (padded) chunk
+  valid   real samples per chunk (before repeat padding); the decoder sees only these frames
   new     new (non-overlap, non-padding) samples per chunk, for throughput accounting
 
 Example:
@@ -43,7 +44,7 @@ def main():
         stride *= l.get("stride", 1)
     granularity = stride * 64
 
-    chunks, new = [], []
+    chunks, valid, new = [], [], []
     with pod5.Reader(args.pod5) as reader:
         for rec in reader.reads():
             x = scale_record(rec, mean, stdev)
@@ -51,6 +52,7 @@ def main():
                 if args.full_only and b - a != size:
                     continue
                 chunks.append(repeat_pad(x[a:b], granularity))
+                valid.append(b - a)
                 new.append((b - a) - (overlap if i else 0))
                 if len(chunks) == args.n:
                     break
@@ -60,7 +62,7 @@ def main():
         sys.exit(f"only {len(chunks)} chunks in {args.pod5}")
     lens = np.array([len(c) for c in chunks], dtype=np.int64)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-    np.savez(args.out, signal=np.concatenate(chunks).astype(np.float16), lens=lens, new=np.array(new))
+    np.savez(args.out, signal=np.concatenate(chunks).astype(np.float16), lens=lens, valid=np.array(valid), new=np.array(new))
     print(f"saved {args.n} chunks ({(lens == size).sum()} full, {(lens < size).sum()} shorter) to {args.out}")
 
 

@@ -92,9 +92,20 @@ def test_encoder_varlen_is_per_chunk():
     assert torch.allclose(packed, alone)
 
 
+def test_encode_chunks_drops_padding_frames():
+    model = tiny_model(1)
+    lens, valid = [512, 256], [512, 130]  # second chunk: 130 real samples, repeat-padded to 256
+    with torch.no_grad():
+        sig = torch.randn(sum(lens))
+        packed = model.encoder.forward_varlen(sig, lens)
+        frames, flens = model.encoder.encode_chunks(sig, lens, valid)
+    assert flens == [128, 33]  # ceil(130 / stride 4)
+    assert torch.equal(frames, torch.cat([packed[:128], packed[128:161]]))
+
+
 def test_pipeline_matches_sequential():
     model = tiny_model(4)
-    batches = [(torch.randn(768), [256, 512]) for _ in range(3)]
+    batches = [(torch.randn(768), [256, 512], [200, 512]) for _ in range(3)]
     eng = DecodeEngine(model, 2, 12, 128, backend="torch")
     pipe = Pipeline(model, eng)
     a = pipe.run(batches, overlap=True)

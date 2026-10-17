@@ -42,7 +42,7 @@ def main():
     assert args.reps > 0
     torch.manual_seed(123)
     z = np.load(args.chunks)
-    lens = z["lens"][:256].tolist()
+    lens, valid = z["lens"][:256].tolist(), z["valid"][:256].tolist()
     assert len(lens) == 256
     signal = torch.from_numpy(z["signal"][:sum(lens)]).cuda()
     new_bases = float(z["new"][:256].sum()) / 12.5
@@ -51,10 +51,9 @@ def main():
     model.projector.to("cuda", torch.bfloat16)
     model.decoder.to("cuda", torch.bfloat16)
     model.eval()
-    steps = math.ceil(max(lens) / 12.5 / model.tokenizer.k) + 1
-    flens = [n // encoder.stride for n in lens]
-    frames = encoder.forward_varlen(signal, lens)
-    enc_ms, _ = measure(lambda: encoder.forward_varlen(signal, lens), reps=args.reps)
+    steps = math.ceil(max(valid) / 12.5 / model.tokenizer.k) + 1
+    frames, flens = encoder.encode_chunks(signal, lens, valid)
+    enc_ms, _ = measure(lambda: encoder.encode_chunks(signal, lens, valid), reps=args.reps)
     for variant in args.variants.split(","):
         parts = variant.split(":")
         eng = DecodeEngine(model, 256, steps, max(flens), attention_backend=parts[0],
@@ -64,7 +63,7 @@ def main():
         pre, pre_samples = measure(lambda: eng.prefill(frames, flens), reps=args.reps)
         dec, dec_samples = measure(lambda: eng.decode(steps), lambda: eng.prefill(frames, flens), args.reps)
         def all_stages():
-            f = encoder.forward_varlen(signal, lens)
+            f, _ = encoder.encode_chunks(signal, lens, valid)
             return eng.generate(f, flens, steps).to("cpu", copy=True)
         total, total_samples = measure(all_stages, reps=args.reps)
         print(json.dumps(dict(kind="pipeline", commit=subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
