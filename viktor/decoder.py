@@ -60,11 +60,15 @@ class Attention(nn.Module):
         self.q_norm = nn.RMSNorm(self.d, eps=cfg.norm_eps)
         self.k_norm = nn.RMSNorm(self.d, eps=cfg.norm_eps)
 
-    def forward(self, x, cos, sin, layer, cache: Optional[KVCache], batch_slice, pos, seqlens):
+    def project(self, x, cos, sin):
+        """q, k (QK-norm + RoPE) and v, each [B, T, heads, head_dim]."""
         B, T, _ = x.shape
         q, k, v = self.qkv_proj(x).view(B, T, self.h + 2 * self.hkv, self.d).split([self.h, self.hkv, self.hkv], 2)
-        q = apply_rope(self.q_norm(q), cos, sin)
-        k = apply_rope(self.k_norm(k), cos, sin)
+        return apply_rope(self.q_norm(q), cos, sin), apply_rope(self.k_norm(k), cos, sin), v
+
+    def forward(self, x, cos, sin, layer, cache: Optional[KVCache], batch_slice, pos, seqlens):
+        B, T, _ = x.shape
+        q, k, v = self.project(x, cos, sin)
         if pos is None:
             if cache is not None:
                 cache.k[layer, batch_slice, :T] = k
@@ -139,6 +143,16 @@ class Decoder(nn.Module):
         for i, layer in enumerate(self.layers):
             x = layer(x, cos, sin, i, cache, batch_slice, pos, seqlens)
         return self.norm(x)
+
+    def forward_probe(self, x, layers):
+        """Full causal pass (no cache) that also returns (q, k) of the given layers: (hidden, [(q, k), ...])."""
+        cos, sin = self.cos[:x.shape[1]], self.sin[:x.shape[1]]
+        qk = []
+        for i, layer in enumerate(self.layers):
+            if i in layers:
+                qk.append(layer.attn.project(layer.attn_norm(x), cos, sin)[:2])
+            x = layer(x, cos, sin, i, None, slice(None), None, None)
+        return self.norm(x), qk
 
     def head(self, h):
         return self.lm_head(h)

@@ -110,8 +110,22 @@ def test_weighted_batch_padding():
     assert tokens_in.shape == targets.shape == w.shape == (2, 8)
     assert w[0].tolist() == [1, 0, 1, 1, .5, 1, 0, 0] and w[1].tolist() == [1, 1, 1, 0, 0, 0, 0, 0]  # EOS weighs 1
     assert targets[0, 5] == EOS and (targets[0, 6:] == PAD).all()
-    loss, correct, scored = model.frame_loss(torch.randn(2, 16, 32), ["ACGTA", "TT"])
+    loss, _, _, correct, scored = model.frame_loss(torch.randn(2, 16, 32), ["ACGTA", "TT"])
     assert loss.ndim == 0 and int(scored) == 6 + 3
+
+
+def test_alignment_loss():
+    from viktor.model import AlignConfig
+    model = tiny_model(1).train()
+    model.align = AlignConfig(layers=(1,), heads=(0, 3), sigma=1.0, weight=0.5)
+    seqs, ws = ["ACGTA", "TT"], [np.array([1, 0, 1, 1, 1], np.float32), np.ones(2, np.float32)]
+    centers = [np.array([0, 3, 6, 9, 12], np.float32), np.array([2, 5], np.float32)]
+    tokens_in, targets, w, c = model.batch(seqs, ws, pad_to=8, centers=centers)
+    assert c[0].tolist() == [0, -1, 6, 9, 12, -1, -1, -1] and c[1].tolist() == [2, 5] + [-1] * 6
+    loss, ce, align, _, _ = model.weighted_loss(torch.randn(2, 16, 32), tokens_in, targets, w, c)
+    assert align > 0 and torch.isclose(loss, ce + 0.5 * align)
+    loss.backward()
+    assert model.decoder.layers[1].attn.qkv_proj.weight.grad.abs().sum() > 0
 
 
 def test_loss_backward_and_freeze():

@@ -2,6 +2,10 @@
 from scratch on make_windows.py windows, one epoch of the train split. DDP via torchrun; decoder in fp32 with
 bf16 autocast, compiled with torch.compile (label lengths padded to multiples of --pad-to).
 
+Loss: weighted token cross-entropy + --align-weight x attention alignment loss (model.AlignConfig: chosen heads'
+attention over the signal prefix pulled towards each base's forced-alignment frame; training only).
+Training and validation windows exclude low-quality reads (data.split_rows); the chr20 heldout set keeps them.
+
 Schedule: WSD (linear warmup, constant, 1 - sqrt decay to 0 over the last --decay-frac of the steps).
 Logged to wandb (rank 0) every --log-every steps, including each GPU's temperature / SM clock / power.
   val      every --val-every steps: teacher-forced weighted loss / base accuracy on fixed 'val' windows
@@ -32,7 +36,8 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from viktor import Basecaller, DecodeEngine, get_tokenizer, load_dorado_encoder
-from viktor.data import WindowDataset, collate, index_files, load_windows
+from viktor.model import AlignConfig
+from viktor.data import WindowDataset, collate, index_files, load_windows, split_rows
 
 
 class Trainable(nn.Module):
@@ -43,8 +48,8 @@ class Trainable(nn.Module):
         self.projector, self.decoder = model.projector, model.decoder
         self._model = [model]
 
-    def forward(self, frames, tokens_in, targets, w):
-        return self._model[0].weighted_loss(frames, tokens_in, targets, w)
+    def forward(self, frames, tokens_in, targets, w, centers):
+        return self._model[0].weighted_loss(frames, tokens_in, targets, w, centers)
 
 
 def wsd(step, total, peak, warmup, decay_frac):
@@ -113,7 +118,7 @@ def fixed_windows(index_dir, split, n, mean, stdev):
     """n windows of one split, sampled deterministically from a few index files."""
     files = index_files(index_dir)
     pick = np.random.default_rng(1).choice(len(files), min(8, len(files)), replace=False)
-    idx = pl.concat([pl.read_parquet(files[i]).filter(pl.col("split") == split) for i in pick])
+    idx = pl.concat([split_rows(pl.read_parquet(files[i]), split) for i in pick])
     return load_windows(idx.sample(min(n, idx.height), seed=1).to_dicts(), mean, stdev)
 
 
@@ -140,7 +145,7 @@ def eval_val(model, val, batch, dev):
         g = val[i:i + batch]
         sig, seqs, ws = collate(g)
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            l, c, s = model.frame_loss(model.encoder(sig.to(dev)), seqs, ws)
+            l, _, _, c, s = model.frame_loss(model.encoder(sig.to(dev)), seqs, ws)
         loss, correct, scored = loss + float(l) * len(g), correct + float(c), scored + float(s)
     model.train()
     return {"val/loss": loss / len(val), "val/acc": correct / scored}
@@ -179,6 +184,10 @@ def main():
     ap.add_argument("--weight-decay", type=float, default=0.1)
     ap.add_argument("--clip", type=float, default=1.0)
     ap.add_argument("--pad-to", type=int, default=128, help="pad label lengths to a multiple (compile shapes)")
+    ap.add_argument("--align-weight", type=float, default=0.1, help="attention alignment loss weight (0 = off)")
+    ap.add_argument("--align-layers", default="2,4", help="decoder layers with supervised heads")
+    ap.add_argument("--align-heads", default="0,4", help="supervised query heads in each of those layers")
+    ap.add_argument("--align-sigma", type=float, default=1.0, help="alignment target width, encoder frames")
     ap.add_argument("--no-compile", action="store_true")
     ap.add_argument("--workers", type=int, default=8, help="data loader workers per GPU")
     ap.add_argument("--log-every", type=int, default=100)
@@ -201,13 +210,16 @@ def main():
     torch._dynamo.config.cache_size_limit = 64
     os.makedirs(args.out, exist_ok=True)
 
-    n_train = pl.scan_parquet(index_files(args.windows)).filter(pl.col("split") == "train").select(pl.len()).collect().item()
+    n_train = split_rows(pl.scan_parquet(index_files(args.windows)), "train").select(pl.len()).collect().item()
     total = n_train // (args.batch * world)  # one epoch
     stop = min(total, args.max_steps or total)
 
     encoder = load_dorado_encoder(args.model_dir).to(dev, torch.float16).eval().use_koi()
     model = Basecaller(encoder, get_tokenizer("base"))
     model.set_encoder_trainable(False)
+    if args.align_weight > 0:
+        model.align = AlignConfig(tuple(int(x) for x in args.align_layers.split(",")),
+                                  tuple(int(x) for x in args.align_heads.split(",")), args.align_sigma, args.align_weight)
     model.projector.to(dev)
     model.decoder.to(dev)
     trainable = Trainable(model)
@@ -259,24 +271,24 @@ def main():
         torch.save({k: state[k] for k in ("step", "projector", "decoder", "args")},
                    os.path.join(args.out, f"snap_{step:07d}.pt"))
 
-    t0, paused, acc = time.time(), 0.0, torch.zeros(4, device=dev)  # loss sum, correct, scored, bases
-    for sig, seqs, ws in dl:
+    t0, paused, acc = time.time(), 0.0, torch.zeros(6, device=dev)  # loss, ce, align sums, correct, scored, bases
+    for sig, seqs, ws, cs in dl:
         if step >= stop:
             break
         lr = wsd(step, total, args.lr, args.warmup, args.decay_frac)
         for g in opt.param_groups:
             g["lr"] = lr
-        tokens_in, targets, w = (t.to(dev, non_blocking=True) for t in model.batch(seqs, ws, args.pad_to))
+        tokens_in, targets, w, centers = (t.to(dev, non_blocking=True) for t in model.batch(seqs, ws, args.pad_to, cs))
         with torch.no_grad():
             frames = encoder(sig.to(dev, non_blocking=True))
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            loss, correct, scored = step_fn(frames, tokens_in, targets, w)
+            loss, ce, align, correct, scored = step_fn(frames, tokens_in, targets, w, centers)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         gnorm = nn.utils.clip_grad_norm_(trainable.parameters(), args.clip)
         opt.step()
         step += 1
-        acc += torch.stack([loss.detach(), correct.float(), scored.float(),
+        acc += torch.stack([loss.detach(), ce.detach(), align.detach(), correct.float(), scored.float(),
                             torch.tensor(float(sum(map(len, seqs))), device=dev)])
         if step % args.temp_every == 0:
             paused += temperature_guard(rank, dev, args.temp_pause, args.temp_resume)
@@ -285,15 +297,16 @@ def main():
             n = args.log_every if step % args.log_every == 0 else step % args.log_every
             dt = time.time() - t0
             if rank == 0:
-                rec = {"train/loss": float(acc[0]) / (n * world), "train/acc": float(acc[1] / acc[2]), "lr": lr,
-                       "grad_norm": float(gnorm), "s_per_step": dt / n, "bases_per_s": float(acc[3]) / dt,
+                rec = {"train/loss": float(acc[0]) / (n * world), "train/ce": float(acc[1]) / (n * world),
+                       "train/align": float(acc[2]) / (n * world), "train/acc": float(acc[3] / acc[4]), "lr": lr,
+                       "grad_norm": float(gnorm), "s_per_step": dt / n, "bases_per_s": float(acc[5]) / dt,
                        "paused_s": paused, "mem_gib": torch.cuda.max_memory_allocated() / 2**30}
                 for i, (temp, clock, power) in enumerate(gpu_stats()):
                     rec |= {f"gpu{i}/temp": temp, f"gpu{i}/sm_mhz": clock, f"gpu{i}/power_w": power}
                 wb.log(rec, step=step)
-                print(f"step {step} loss {rec['train/loss']:.4f} acc {rec['train/acc']:.4f} lr {lr:.2e} "
+                print(f"step {step} loss {rec['train/loss']:.4f} ce {rec['train/ce']:.4f} align {rec['train/align']:.3f} acc {rec['train/acc']:.4f} lr {lr:.2e} "
                       f"{rec['s_per_step']:.3f} s/step {rec['bases_per_s']:.0f} bases/s", flush=True)
-            t0, paused, acc = time.time(), 0.0, torch.zeros(4, device=dev)
+            t0, paused, acc = time.time(), 0.0, torch.zeros(6, device=dev)
         if step % args.val_every == 0 and rank == 0:
             wb.log(eval_val(model, val, 64, dev), step=step)
         if step % args.ckpt_every == 0 or step == stop:

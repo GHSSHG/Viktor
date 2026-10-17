@@ -4,6 +4,11 @@ The signal is read from pod5 on the fly and preprocessed exactly as at inference
 the child read, then the window x[win : win + 12288]); the label is fetched from the reference.
 WindowDataset streams one split: each (rank, worker) owns a disjoint share of the index files (one per pod5
 file), loads a few reads at a time (all their windows) and yields from a shuffle buffer.
+Training windows also carry each label base's prefix frame (window-local encoder frame of its signal midpoint),
+from the same stage-6 forced alignment make_windows.py used (stage-6 file of the same name), for the attention
+alignment loss.
+Training and validation use only windows of full-quality reads (read weight w == 1); the chr20 'heldout'
+test set keeps every read, so it stays the same for every model compared on it.
 """
 
 import glob
@@ -13,19 +18,32 @@ import random
 import numpy as np
 import polars as pl
 import pod5
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.parquet as pq
 import pysam
 import torch
 
-from .chunking import dorado_scale
+from .chunking import DNA_TRIM_START, dorado_scale
 
 SIZE = 12288
+STRIDE = 12  # signal samples per encoder frame
+CRF_FRAME = 6  # signal samples per stage-6 (CRF) frame
 EDGE_WEIGHT = 0.5  # first and last base of a window
 REF = os.path.expanduser("~/Work/BasecallerData/reference/hg002v1.2.fa")
+STAGE6 = os.path.expanduser("~/Work/BasecallerData/stage6_align")
 _COMP = str.maketrans("ACGTN", "TGCAN")
 
 
 def index_files(index_dir):
     return sorted(glob.glob(os.path.join(index_dir, "*.pod5.parquet")))
+
+
+def split_rows(index, split):
+    """Index rows (DataFrame or LazyFrame) of one split; low-quality reads (w < 1) are excluded except from
+    the shared 'heldout' test set."""
+    keep = pl.col("split") == split
+    return index.filter(keep if split == "heldout" else keep & (pl.col("w") == 1))
 
 
 def read_signals(reader, rows, mean, stdev):
@@ -57,6 +75,35 @@ def base_weights(r, seq):
     return w
 
 
+def load_segments(stage6_file, read_ids):
+    """Stage-6 alignments ('ok' segments) of the given reads: flat uint16 dwell array and
+    {read_id: [(offset, n, f_first, f_exit), ...]} (dwell of a segment = flat[offset : offset + n - 1])."""
+    t = pq.read_table(stage6_file, columns=["read_id", "n", "f_first", "f_exit", "dwell", "status"])
+    t = t.filter(pc.and_(pc.equal(t["status"], "ok"), pc.is_in(t["read_id"], pa.array(list(read_ids), pa.string()))))
+    dwell = t["dwell"].combine_chunks()
+    flat, offs = dwell.values.to_numpy(zero_copy_only=False), dwell.offsets.to_numpy()
+    segs = {}
+    for i, (rid, n, f0, fx) in enumerate(zip(*(t[c].to_pylist() for c in ("read_id", "n", "f_first", "f_exit")))):
+        segs.setdefault(rid, []).append((int(offs[i]), n, f0, fx))
+    return flat, segs
+
+
+def base_centers(r, flat, segs):
+    """Window-local encoder frame of each label base's signal midpoint (read order), as make_windows.window_rows
+    derives the label: base i enters at CRF frame e_i = f_first + cumsum(dwell), midpoint 3 * (e_i + e_{i+1})."""
+    A = r["win"] + DNA_TRIM_START  # window start in child-read samples
+    for off, n, f0, fx in segs[r["read_id"]]:
+        if CRF_FRAME * f0 <= A and A + SIZE <= CRF_FRAME * (fx + 1):
+            e = np.empty(n + 1, np.int64)
+            e[0], e[n] = f0, fx + 1
+            e[1:n] = f0 + np.cumsum(flat[off:off + n - 1], dtype=np.int64)
+            mid = CRF_FRAME // 2 * (e[:-1] + e[1:])
+            lo, hi = np.searchsorted(mid, A), np.searchsorted(mid, A + SIZE)
+            assert hi - lo == r["n_bases"], (r["read_id"], r["win"])
+            return ((mid[lo:hi] - A - STRIDE / 2) / STRIDE).astype(np.float32)
+    raise KeyError(f"no stage-6 segment holds window {r['read_id']} {r['win']}")
+
+
 def load_windows(rows, mean, stdev, ref=REF):
     """Index rows (any pod5 files) -> list of (signal, label, weights), in row order."""
     fa = pysam.FastaFile(ref)
@@ -73,11 +120,12 @@ def load_windows(rows, mean, stdev, ref=REF):
 
 
 class WindowDataset(torch.utils.data.IterableDataset):
-    """Yields (signal fp16 [12288], label str, weights float32 [len]) forever, reshuffled every pass."""
+    """Yields (signal fp16 [12288], label str, weights float32 [len], base frames float32 [len]) forever,
+    reshuffled every pass."""
 
-    def __init__(self, index_dir, split, mean, stdev, rank=0, world=1, seed=0, ref=REF,
+    def __init__(self, index_dir, split, mean, stdev, rank=0, world=1, seed=0, ref=REF, stage6=STAGE6,
                  reads_per_load=32, buffer=4096):
-        self.files, self.split, self.ref = index_files(index_dir), split, ref
+        self.files, self.split, self.ref, self.stage6 = index_files(index_dir), split, ref, stage6
         self.mean, self.stdev, self.rank, self.world, self.seed = mean, stdev, rank, world, seed
         self.reads_per_load, self.buffer = reads_per_load, buffer
 
@@ -91,21 +139,23 @@ class WindowDataset(torch.utils.data.IterableDataset):
         buf = []
         while True:
             for path in rng.sample(mine, len(mine)):
-                idx = pl.read_parquet(path).filter(pl.col("split") == self.split)
+                idx = split_rows(pl.read_parquet(path), self.split)
                 if idx.height == 0:
                     continue
                 groups = [g.to_dicts() for g in idx.partition_by("read_id")]
                 rng.shuffle(groups)
+                flat, segs = load_segments(os.path.join(self.stage6, os.path.basename(path)), idx["read_id"].unique())
                 with pod5.Reader(groups[0][0]["pod5"]) as reader:
                     for i in range(0, len(groups), self.reads_per_load):
                         rows = [r for g in groups[i:i + self.reads_per_load] for r in g]
                         for r, x in zip(rows, read_signals(reader, rows, self.mean, self.stdev)):
                             seq = label(fa, r)
-                            buf.append((x, seq, base_weights(r, seq)))
+                            buf.append((x, seq, base_weights(r, seq), base_centers(r, flat, segs)))
                         while len(buf) >= self.buffer:
                             yield buf.pop(rng.randrange(len(buf)))
 
 
 def collate(items):
-    sig = torch.from_numpy(np.stack([x for x, _, _ in items]))[:, None]
-    return sig, [s for _, s, _ in items], [w for _, _, w in items]
+    """(signal [B, 1, 12288], labels, weights[, base frames]) from WindowDataset or load_windows items."""
+    sig = torch.from_numpy(np.stack([it[0] for it in items]))[:, None]
+    return (sig, *([it[i] for it in items] for i in range(1, len(items[0]))))
