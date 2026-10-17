@@ -22,12 +22,15 @@ pod5 int16 信号
 | `viktor/encoder.py` | Dorado SUP 编码器的 PyTorch 实现（训练、参考）与权重加载；`use_koi()` 切到 koi；`encode_chunks()` 给 decoder 用，去掉补齐帧 |
 | `viktor/koi.py`, `csrc/koi_tx.cpp` | koi VCS 卷积与 Transformer、koi 束搜索的 C++ 扩展（首次运行时 JIT 编译） |
 | `viktor/decoder.py` | decoder 参考实现（训练用）和静态 KV cache |
-| `viktor/model.py` | `Basecaller` = 编码器 + Projector + decoder；teacher-forcing loss（按碱基数归一化）；`set_encoder_trainable()` |
+| `viktor/model.py` | `Basecaller` = 编码器 + Projector + decoder；加权 teacher-forcing loss（逐碱基权重，标签长度补齐到固定档位以便 compile）；`set_encoder_trainable()`（koi 编码器不可训练） |
 | `viktor/engine.py` | `DecodeEngine`：贪心解码，语法约束（尾部 token 后强制 EOS），每步一个 CUDA Graph |
 | `viktor/fast_decoder.py` | 推理前向：融合 kernel + flash-attn；prefill 最后一层只算 BOS |
 | `viktor/triton_ops.py` | 融合 kernel：add+RMSNorm、QK-norm+RoPE+写 KV、SwiGLU |
 | `viktor/decode_attention.py` | 单 query 的 GQA 解码 attention（sm80 默认使用） |
-| `scripts/make_chunks.py` | pod5 → chunk 集 `.npz`（signal、lens、valid、new） |
+| `viktor/data.py` | 训练窗口：在线读 pod5 信号（与推理相同的预处理）、从参考取标签、逐碱基权重、`WindowDataset` |
+| `scripts/make_chunks.py` | pod5 → chunk 集 `.npz`（signal、lens、valid、new），测速用 |
+| `scripts/make_windows.py` | 训练数据：从 BasecallerData 第 6 阶段的强制比对结果切出 Dorado 式 12288 点窗口的索引（`build`），并用 Dorado CRF 抽查标签（`check`） |
+| `scripts/train.py` | 第一阶段 SFT：koi 编码器冻结，单碱基 decoder 从头训练 1 个 epoch；DDP、torch.compile、WSD、wandb、温度保护 |
 | `scripts/bench.py` | 端到端测速：编码器、prefill、解码各阶段与总吞吐 |
 | `scripts/basecall_crf.py`, `score_paf.py` | 对照路径：koi 编码器 + Dorado CRF 头 + koi 束搜索 + Dorado 拼接，用 minimap2 PAF 打分。用于证明编码器和预处理与 Dorado 一致 |
 | `tests/test_viktor.py` | CPU 单元测试 |
@@ -50,7 +53,14 @@ MODEL=~/tools/dorado_models/dna_r10.4.1_e8.2_400bps_sup@v5.2.0
 python scripts/make_chunks.py --pod5 READS.pod5 --model-dir $MODEL --n 2048 --out results/chunks_vcs_2048.npz
 
 # 测速
-CUDA_VISIBLE_DEVICES=0 python -m scripts.bench --model-dir $MODEL --tokenizer 4mer --chunks results/chunks_vcs_2048.npz
+CUDA_VISIBLE_DEVICES=0 python -m scripts.bench --model-dir $MODEL --tokenizer base --chunks results/chunks_vcs_2048.npz
+
+# 训练数据（CPU，约 4–5 分钟）与标签抽查
+python -m scripts.make_windows build --out ~/Work/BasecallerData/viktor_win12288 --workers 16
+CUDA_VISIBLE_DEVICES=0 python -m scripts.make_windows check --out ~/Work/BasecallerData/viktor_win12288 --model-dir $MODEL
+
+# 训练（4 卡，1 个 epoch）
+torchrun --nproc-per-node 4 -m scripts.train --model-dir $MODEL --windows ~/Work/BasecallerData/viktor_win12288 --out runs/sft1
 
 # 检查
 python -m pytest tests/test_viktor.py

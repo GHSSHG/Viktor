@@ -1,6 +1,7 @@
 import os
 import random
 
+import numpy as np
 import pytest
 import torch
 
@@ -101,6 +102,16 @@ def test_encode_chunks_drops_padding_frames():
         frames, flens = model.encoder.encode_chunks(sig, lens, valid)
     assert flens == [128, 33]  # ceil(130 / stride 4)
     assert torch.equal(frames, torch.cat([packed[:128], packed[128:161]]))
+
+
+def test_weighted_batch_padding():
+    model = tiny_model(1)
+    tokens_in, targets, w = model.batch(["ACGTA", "TT"], [np.array([1, 0, 1, 1, .5], np.float32), np.ones(2, np.float32)], pad_to=8)
+    assert tokens_in.shape == targets.shape == w.shape == (2, 8)
+    assert w[0].tolist() == [1, 0, 1, 1, .5, 1, 0, 0] and w[1].tolist() == [1, 1, 1, 0, 0, 0, 0, 0]  # EOS weighs 1
+    assert targets[0, 5] == EOS and (targets[0, 6:] == PAD).all()
+    loss, correct, scored = model.frame_loss(torch.randn(2, 16, 32), ["ACGTA", "TT"])
+    assert loss.ndim == 0 and int(scored) == 6 + 3
 
 
 def test_loss_backward_and_freeze():

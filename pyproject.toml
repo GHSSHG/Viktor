@@ -10,7 +10,8 @@ dependencies = [
 
 [project.optional-dependencies]
 flash = ["flash-attn>=2.5"]
-data = ["pod5", "numpy"]
+data = ["pod5", "numpy", "polars", "pysam"]
+train = ["wandb", "nvidia-ml-py", "edlib"]
 dev = ["pytest"]
 
 [build-system]

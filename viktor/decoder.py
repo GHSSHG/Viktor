@@ -75,6 +75,10 @@ class Attention(nn.Module):
         return self.o_proj(o.reshape(B, T, self.h * self.d))
 
     def _causal(self, q, k, v):
+        if q.is_cuda and flash_attn_func is not None and torch.is_autocast_enabled("cuda"):
+            # training under autocast: q/k come out of the fp32 QK-norm, flash-attn needs bf16/fp16
+            dt = torch.get_autocast_dtype("cuda")
+            q, k, v = q.to(dt), k.to(dt), v.to(dt)
         if _use_flash(q):
             return flash_attn_func(q, k, v, causal=True)
         rep = self.h // self.hkv
