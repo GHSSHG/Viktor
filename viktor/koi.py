@@ -23,20 +23,21 @@ def _koi_dir():
     return found[-1]
 
 
-def _cuda_runtime_dir():
-    import nvidia.cuda_runtime
-    return os.path.dirname(nvidia.cuda_runtime.__file__)
+def _nvidia_dir(name):
+    import nvidia
+    return os.path.join(os.path.dirname(nvidia.__file__), name)
 
 
 def load_extension():
     global _ext
     if _ext is None:
         from torch.utils.cpp_extension import load
-        koi, cudart = _koi_dir(), _cuda_runtime_dir()
+        koi, cudart = _koi_dir(), _nvidia_dir("cuda_runtime")
         _ext = load(
             name="viktor_koi_tx",
             sources=[os.path.join(_ROOT, "viktor", "csrc", "koi_tx.cpp")],
-            extra_include_paths=[os.path.join(koi, "include"), os.path.join(cudart, "include")],
+            extra_include_paths=[os.path.join(koi, "include"), os.path.join(cudart, "include"),
+                                 os.path.join(_nvidia_dir("cuda_nvcc"), "include")],
             extra_cflags=["-O3"],
             extra_ldflags=[os.path.join(koi, "lib", "libkoi.a"), f"-L{os.path.join(cudart, 'lib')}",
                            "-l:libcudart.so.12", f"-Wl,-rpath,{os.path.join(cudart, 'lib')}"],
