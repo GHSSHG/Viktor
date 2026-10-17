@@ -40,6 +40,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--length", type=int, default=1271)
     ap.add_argument("--profile", action="store_true")
+    ap.add_argument("--triton", action="store_true")
     args = ap.parse_args()
     torch.manual_seed(123)
     B, H, HK, D, S = 256, 8, 2, 64, args.length
@@ -62,6 +63,12 @@ def main():
             "split4": lambda: flash_attn_with_kvcache(q, k, v, cache_seqlens=lens, num_splits=4),
             "append": lambda: flash_attn_with_kvcache(q, k, v, k=kn, v=vn, cache_seqlens=prev, num_splits=1),
         }
+        if args.triton:
+            from viktor.decode_attention import decode_attention
+            for block in (64, 128, 256):
+                for splits in (1, 2, 4):
+                    variants[f"triton_{block}_{splits}"] = lambda block=block, splits=splits: decode_attention(
+                        q[:, 0], k, v, lens, block=block, splits=splits)[:, None]
         mask = torch.arange(S, device="cuda")[None, :] < lens[:4, None]
         ref = F.scaled_dot_product_attention(q[:4].transpose(1, 2).float(),
             k[:4].transpose(1, 2).repeat_interleave(4, 1).float(),
