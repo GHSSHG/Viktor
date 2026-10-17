@@ -105,15 +105,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-dir", required=True)
     ap.add_argument("--pod5", required=True)
-    ap.add_argument("--encoder", choices=["torch", "koi", "koi-f32acc"], required=True)
+    ap.add_argument("--encoder", choices=["torch", "koi"], required=True)
     ap.add_argument("--decoder", choices=["beam", "viterbi"], default="beam")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
     dev = torch.device("cuda")
     enc = load_dorado_encoder(args.model_dir).to(dev, torch.float16).eval()
-    if args.encoder.startswith("koi"):
-        enc.use_koi(swiglu_f32_accum=args.encoder == "koi-f32acc")
+    if args.encoder == "koi":
+        enc.use_koi()
     head = CRFHead(args.model_dir).to(dev).eval()
     with open(os.path.join(args.model_dir, "config.toml"), "rb") as f:
         q = tomllib.load(f)["qscore"]
