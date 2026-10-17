@@ -295,7 +295,47 @@ private:
     std::vector<Layer> layer_vec;
 };
 
+// dorado/basecall/decode/CUDADecoder.cpp: beam_search_part_1, fixed-size chunks (no aux).
+// scores: [N, T, C] fp16 CUDA CRF scores (C = 4096 for SUP, blank score fixed).
+// Returns [3, N, T] int8: moves, sequence (ASCII), qstring (ASCII).
+at::Tensor beam_search(const at::Tensor &scores_in,
+                       double post_clamp,
+                       int64_t beam_width,
+                       double beam_cut,
+                       double blank_score,
+                       double q_scale,
+                       double q_shift,
+                       bool move_pad) {
+    auto scores = scores_in.contiguous();
+    const long N = scores.size(0), T = scores.size(1), C = scores.size(2);
+    auto i32 = scores.options().dtype(torch::kInt32);
+    auto i8 = scores.options().dtype(torch::kChar);
+    auto chunks = torch::empty({N, 4}, i32);
+    chunks.select(1, 0) = torch::arange(0, int(T * N), int(T), i32);
+    chunks.select(1, 2) = torch::arange(0, int(T * N), int(T), i32);
+    chunks.select(1, 1) = int(T);
+    chunks.select(1, 3) = 0;
+    auto chunk_results = torch::empty({N, 8}, i32);
+    auto aux = torch::empty({N * (T + 1) * (C + 4 * beam_width)}, i8);
+    auto path = torch::zeros({N * (T + 1)}, i32);
+    auto msq = torch::zeros({3, N * T}, i8);
+    auto moves = msq[0], sequence = msq[1], qstring = msq[2];
+    auto stream = c10::cuda::getCurrentCUDAStream().stream();
+#define KOI_DECODE_ARGS                                                                         \
+    stream, chunks.data_ptr(), chunk_results.data_ptr(), int(N), scores.data_ptr(),            \
+            float(post_clamp), int(C), aux.data_ptr(), path.data_ptr(), moves.data_ptr(), NULL, \
+            sequence.data_ptr(), qstring.data_ptr(), float(q_scale), float(q_shift),             \
+            int(beam_width), float(beam_cut), float(blank_score)
+    check(host_back_guide_step(KOI_DECODE_ARGS), "back_guide_step");
+    check(host_beam_search_step(KOI_DECODE_ARGS), "beam_search_step");
+    check(host_compute_posts_step(KOI_DECODE_ARGS), "compute_posts_step");
+    check(host_run_decode(KOI_DECODE_ARGS, int(move_pad)), "run_decode");
+#undef KOI_DECODE_ARGS
+    return msq.reshape({3, N, -1});
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("beam_search", &beam_search);
     py::class_<KoiTxStack>(m, "KoiTxStack")
             .def(py::init<const std::vector<std::vector<at::Tensor>> &, const std::vector<double> &,
                           int64_t, int64_t, int64_t, int64_t, double, int64_t, bool, int64_t, bool>())

@@ -2,8 +2,8 @@
 
 Chunking and stitching follow Dorado's variable-chunk-size path for transformer models
 (utils::generate_variable_chunks_tx, BasecallerNode repeat-padding to 768 samples, stitch_chunks).
-Decoding is a free Viterbi over the CRF (layout as SUPEncoder/crf.py, validated against Dorado);
-Dorado itself uses beam search.
+Decoding: Dorado's own GPU beam search (koi, CUDADecoder defaults: beam width 32, beam cut 100,
+blank 2.0), or a free Viterbi over the CRF (layout as SUPEncoder/crf.py).
 
 Example:
   CUDA_VISIBLE_DEVICES=1 python scripts/basecall_crf.py --model-dir MODEL --pod5 R.pod5 --encoder torch --out calls.fa
@@ -11,11 +11,17 @@ Example:
 
 import argparse
 import os
+import sys
 
 import numpy as np
 import pod5
 import torch
 import torch.nn.functional as F
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    import tomli as tomllib
 
 from viktor import load_dorado_encoder
 from viktor.encoder import _load_tensor
@@ -43,24 +49,26 @@ def repeat_pad(x, unit):
 
 
 class CRFHead(torch.nn.Module):
-    def __init__(self, model_dir):
-        super().__init__()
-        t = lambda n: _load_tensor(os.path.join(model_dir, n + ".tensor"))
-        self.up = torch.nn.Linear(512, 1024)
-        self.up.weight.data, self.up.bias.data = t("upsample.linear.weight"), t("upsample.linear.bias")
-        self.crf = torch.nn.Linear(512, NS * NB, bias=False)
-        self.crf.weight.data = t("crf.linear.weight")
+    """Dorado LinearUpsample + LinearScaledCRF in fp16 (weight pre-multiplied by scale in fp16)."""
 
-    def forward(self, h):  # h [N, T, 512] -> move scores [N, 2T, 1024, 4], blank score is the constant 2.0
-        n, t, _ = h.shape
-        x = self.up(h.to(self.up.weight.dtype)).reshape(n, 2 * t, 512)
-        return (F.linear(x.half(), self.crf.weight.half()) * 5.0).view(n, 2 * t, NS, NB)
+    def __init__(self, model_dir, scale=5.0):
+        super().__init__()
+        t = lambda n: _load_tensor(os.path.join(model_dir, n + ".tensor")).half()
+        self.register_buffer("up_w", t("upsample.linear.weight"))
+        self.register_buffer("up_b", t("upsample.linear.bias"))
+        self.register_buffer("crf_w", t("crf.linear.weight") * scale)
+
+    def forward(self, h):  # h [N, T, 512] -> scores [N, 2T, 4096] fp16, blank score is the constant 2.0
+        n, t, c = h.shape
+        x = F.linear(h.half(), self.up_w, self.up_b).reshape(n, 2 * t, c)
+        return F.linear(x, self.crf_w)
 
 
 @torch.no_grad()
 def viterbi(scores):
-    """scores [N, F, 1024, 4] -> per chunk (sequence, moves[F])."""
+    """scores [N, F, 4096] -> per chunk (sequence, moves[F])."""
     n, nf = scores.shape[:2]
+    scores = scores.view(n, nf, NS, NB)
     dev = scores.device
     j = torch.arange(NS, device=dev)
     pred = torch.stack([k * (NS // NB) + j // NB for k in range(NB)], 1)
@@ -80,6 +88,17 @@ def viterbi(scores):
                 moves[t] = 1
                 s = predc[s, a - 1]
         out.append(("".join(reversed(seq)), moves))
+    return out
+
+
+def beam_search(scores, q_scale, q_shift):
+    """Dorado CUDADecoder::beam_search_part_1/2 on koi. scores [N, F, 4096] -> per chunk (sequence, moves[F])."""
+    from viktor.koi import load_extension
+    msq = load_extension().beam_search(scores, 0.0, 32, 100.0, 2.0, q_scale, q_shift, False).cpu().numpy()
+    out = []
+    for i in range(scores.shape[0]):
+        moves = msq[0, i].astype(np.uint8)
+        out.append((msq[1, i, :int(moves.sum())].tobytes().decode(), moves))
     return out
 
 
@@ -104,6 +123,7 @@ def main():
     ap.add_argument("--model-dir", required=True)
     ap.add_argument("--pod5", required=True)
     ap.add_argument("--encoder", choices=["torch", "koi", "koi-f32acc"], required=True)
+    ap.add_argument("--decoder", choices=["beam", "viterbi"], default="beam")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -112,6 +132,9 @@ def main():
     if args.encoder.startswith("koi"):
         enc.use_koi(swiglu_f32_accum=args.encoder == "koi-f32acc")
     head = CRFHead(args.model_dir).to(dev).eval()
+    with open(os.path.join(args.model_dir, "config.toml"), "rb") as f:
+        q = tomllib.load(f)["qscore"]
+    decode = (lambda s: beam_search(s, q["scale"], q["bias"])) if args.decoder == "beam" else viterbi
 
     reads, items = {}, []  # items: (read_id, chunk_idx, start, raw_size, padded signal)
     with pod5.Reader(args.pod5) as r:
@@ -134,7 +157,7 @@ def main():
                 n_pad = -(-len(g) // 64) * 64  # koi batch granularity; extra rows are copies, discarded
                 sig = np.stack([it[4] for it in g] + [g[0][4]] * (n_pad - len(g)))
                 h = enc(torch.from_numpy(sig).to(dev, torch.float16)[:, None])
-                for it, (seq, moves) in zip(g, viterbi(head(h)[:len(g)])):
+                for it, (seq, moves) in zip(g, decode(head(h)[:len(g)])):
                     results[(it[0], it[1])] = (it[2], it[3], seq, moves)
 
     with open(args.out, "w") as f:
