@@ -35,7 +35,10 @@ class DecodeEngine:
         self.bias[[PAD, BOS]] = float("-inf")
         self.is_tail = model.tokenizer.tail_mask.to(dev)
 
+        if compile:
+            torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 64)
         self.step_fn = torch.compile(self._step) if compile else self._step
+        self.prefill_fn = torch.compile(self._prefill_part) if compile else self._prefill_part
         self.graph = None
         if cuda_graph and dev.type == "cuda":
             self._capture()
@@ -68,6 +71,10 @@ class DecodeEngine:
         with torch.cuda.graph(self.graph):
             self.step_fn()
 
+    def _prefill_part(self, frames, bos, lo, hi):
+        x = torch.cat([self.model.projector(frames.to(self.dtype)), bos.expand(hi - lo, 1, -1)], 1)
+        return self.dec(x, cache=self.cache, batch_slice=slice(lo, hi))[:, -1]
+
     @torch.no_grad()
     def prefill(self, frames):
         """frames: [B, n_frames, d_enc] encoder output. Fills the cache and emits the first token."""
@@ -76,8 +83,7 @@ class DecodeEngine:
         last = []
         for lo in range(0, self.B, self.prefill_batch):
             hi = min(self.B, lo + self.prefill_batch)
-            x = torch.cat([self.model.projector(frames[lo:hi].to(self.dtype)), bos.expand(hi - lo, 1, -1)], 1)
-            last.append(self.dec(x, cache=self.cache, batch_slice=slice(lo, hi))[:, -1])
+            last.append(self.prefill_fn(frames[lo:hi], bos, lo, hi))
         self.tok.fill_(BOS)
         first = self._select(self.dec.head(torch.cat(last)), self.tok)
         self.out.fill_(PAD)
