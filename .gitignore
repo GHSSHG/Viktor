@@ -9,3 +9,4 @@ results/
 third_party/
 benchmarks/
 runs/
+.tmp_pod5_*/
