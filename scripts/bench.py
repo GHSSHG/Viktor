@@ -6,7 +6,7 @@ number of decode steps: the expected output length of its longest chunk (+ EOS).
 new bases only (overlap and repeat padding excluded), at 12.5 samples per base.
 
 Example:
-  CUDA_VISIBLE_DEVICES=0 python scripts/bench.py --model-dir MODEL --tokenizer 4mer --chunks results/chunks_vcs_2048.npz
+  CUDA_VISIBLE_DEVICES=0 python -m scripts.bench --model-dir MODEL --tokenizer 4mer --chunks results/chunks_vcs_2048.npz
 """
 
 import argparse
@@ -36,9 +36,12 @@ def main():
     ap.add_argument("--model-dir", required=True)
     ap.add_argument("--tokenizer", choices=["base", "4mer"], required=True)
     ap.add_argument("--chunks", required=True, help=".npz from make_chunks.py")
-    ap.add_argument("--batch", type=int, default=512)
+    ap.add_argument("--batch", type=int, default=256)
+    ap.add_argument("--n-chunks", type=int, default=256, help="input limit; defaults to one batch of 256 chunks")
     ap.add_argument("--prefill-batch", type=int, default=128)
     ap.add_argument("--backend", choices=["triton", "torch"], default="triton")
+    ap.add_argument("--attention-backend", choices=["auto", "flash", "split", "split2", "split4", "triton64", "triton256"], default="auto")
+    ap.add_argument("--prefill-mode", choices=["last", "full"], default="last")
     ap.add_argument("--json", default=None, help="append the result as one JSON line to this file")
     args = ap.parse_args()
 
@@ -51,9 +54,12 @@ def main():
     model.eval()
 
     z = np.load(args.chunks)
-    sig, lens, new = torch.from_numpy(z["signal"]).to(dev), z["lens"], z["new"]
+    lens, new = z["lens"][:args.n_chunks], z["new"][:args.n_chunks]
+    sig = torch.from_numpy(z["signal"][:int(lens.sum())]).to(dev)
     offs = np.concatenate([[0], np.cumsum(lens)])
     n_batches = len(lens) // args.batch
+    if n_batches == 0:
+        ap.error("--n-chunks and the dataset must contain at least --batch chunks")
     batches, steps, new_bases = [], [], 0.0
     for i in range(n_batches):
         a, b = i * args.batch, (i + 1) * args.batch
@@ -64,7 +70,8 @@ def main():
 
     torch.cuda.reset_peak_memory_stats()
     engine = DecodeEngine(model, args.batch, max(steps), encoder.chunksize // encoder.stride,
-                          backend=args.backend, prefill_batch=args.prefill_batch)
+                          backend=args.backend, prefill_batch=args.prefill_batch,
+                          attention_backend=args.attention_backend, prefill_mode=args.prefill_mode)
     pipe = Pipeline(model, engine)
 
     with torch.no_grad():
@@ -80,6 +87,8 @@ def main():
     res = {
         "gpu": torch.cuda.get_device_name(), "chunks": args.chunks, "tokenizer": args.tokenizer,
         "backend": args.backend, "batch": args.batch, "n_chunks": n_chunks,
+        "attention_backend": engine.fast.attention_backend if engine.backend == "triton" else "torch",
+        "prefill_mode": args.prefill_mode,
         "full_chunks": int((lens[:n_chunks] == encoder.chunksize).sum()), "steps": steps,
         "ms_per_chunk": {k: round(v / n_chunks * 1e3, 4) for k, v in
                          {"encoder": t_enc, "prefill": t_pre, "decode": t_all - t_pre,

@@ -1,6 +1,6 @@
 """Short, graph-captured decode attention comparison; no model changes.
 
-Run one process per GPU, e.g. CUDA_VISIBLE_DEVICES=0 python scripts/bench_attention.py --length 1271.
+Run one process per GPU, e.g. CUDA_VISIBLE_DEVICES=0 python -m scripts.bench_attention --length 1271.
 All variants see identical BF16 inputs and per-sequence lengths. Append writes back the existing
 last KV entry, so it implements exactly the same attention as the other variants.
 """

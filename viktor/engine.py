@@ -26,7 +26,7 @@ def _triton_available():
 class DecodeEngine:
     def __init__(self, model: Basecaller, batch_size: int, max_new_tokens: int, max_frames: int,
                  backend: str = "auto", cuda_graph: bool = True, prefill_batch: int = 128, check_every: int = 32,
-                 attention_backend: str = "flash", prefill_mode: str = "full"):
+                 attention_backend: str = "auto", prefill_mode: str = "last"):
         self.model, self.dec = model, model.decoder
         dev = self.dec.lm_head.weight.device
         self.dtype = self.dec.lm_head.weight.dtype

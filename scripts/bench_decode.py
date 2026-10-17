@@ -36,9 +36,10 @@ def main():
     ap.add_argument("--model-dir", required=True)
     ap.add_argument("--chunks", required=True)
     ap.add_argument("--tokenizer", choices=["4mer", "base"], default="4mer")
-    ap.add_argument("--variants", default="flash,split,split2,split4")
+    ap.add_argument("--variants", default="flash:full,split:full,auto:last")
     ap.add_argument("--reps", type=int, default=3)
     args = ap.parse_args()
+    assert args.reps > 0
     torch.manual_seed(123)
     z = np.load(args.chunks)
     lens = z["lens"][:256].tolist()
@@ -68,7 +69,8 @@ def main():
         total, total_samples = measure(all_stages, reps=args.reps)
         print(json.dumps(dict(kind="pipeline", commit=subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
             gpu=torch.cuda.get_device_name(), tokenizer=args.tokenizer, chunks=args.chunks, n_chunks=256,
-            batch=256, steps=steps, variant=variant, ms_per_chunk=dict(encoder=enc_ms/256, prefill=pre/256,
+            batch=256, steps=steps, variant=variant, attention_backend=eng.fast.attention_backend,
+            prefill_mode=eng.prefill_mode, ms_per_chunk=dict(encoder=enc_ms/256, prefill=pre/256,
             decode=dec/256, total=total/256), bases_per_s=new_bases/(total/1000),
             samples_ms=dict(prefill=pre_samples, decode=dec_samples, total=total_samples),
             peak_allocated_gib=torch.cuda.max_memory_allocated()/2**30)), flush=True)

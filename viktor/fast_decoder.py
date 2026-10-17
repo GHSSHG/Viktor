@@ -14,11 +14,17 @@ from .triton_ops import add_rmsnorm, qkv_rope_cache, swiglu
 
 
 class FastDecoder:
-    def __init__(self, dec: Decoder, attention_backend="flash"):
+    def __init__(self, dec: Decoder, attention_backend="auto"):
         cfg = dec.cfg
         assert all(n & (n - 1) == 0 for n in (cfg.n_heads, cfg.n_kv_heads, cfg.head_dim // 2)), \
             "kernels need power-of-two head counts and head_dim / 2"
         self.dec, self.cfg = dec, cfg
+        if attention_backend == "auto":
+            weight = dec.lm_head.weight
+            tuned = (cfg.n_heads, cfg.n_kv_heads, cfg.head_dim) == (8, 2, 64)
+            tuned = tuned and weight.dtype == torch.bfloat16 and weight.is_cuda
+            tuned = tuned and torch.cuda.get_device_capability(weight.device) == (8, 0)
+            attention_backend = "triton64" if tuned else "split"
         if attention_backend not in ("flash", "split", "split2", "split4", "triton64", "triton256"):
             raise ValueError(f"unknown decode attention backend: {attention_backend}")
         self.attention_backend = attention_backend

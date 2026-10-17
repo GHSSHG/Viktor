@@ -1,6 +1,6 @@
 """GPU numerical checks for optimized inference, with 256 sequences and eight unchanged layers.
 
-python -m tests.check_decode_optimization --tokenizer 4mer
+PYTHONPATH=. python tests/check_decode_optimization.py --tokenizer 4mer
 """
 import argparse
 import json
@@ -15,7 +15,7 @@ from viktor import Basecaller, DecodeEngine, get_tokenizer
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tokenizer", choices=["4mer", "base"], default="4mer")
-    ap.add_argument("--backend", default="split")
+    ap.add_argument("--backend", default="auto")
     args = ap.parse_args()
     torch.manual_seed(42)
     enc = nn.Identity()
