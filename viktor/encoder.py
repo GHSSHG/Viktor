@@ -119,7 +119,9 @@ class DoradoEncoder(nn.Module):
             self.stride *= l["stride"]
         tx = enc["transformer_encoder"]
         lay = tx["layer"]
+        self.tx_layer = lay
         self.d_model = lay["d_model"]
+        self.koi = None
         self.transformer_encoder = nn.Sequential(*[
             TxLayer(lay["d_model"], lay["nhead"], lay["dim_feedforward"], lay["deepnorm_alpha"],
                     lay["attn_window"], lay.get("theta", 10000.0), lay.get("max_seq_len", 4096))
@@ -132,8 +134,20 @@ class DoradoEncoder(nn.Module):
     def standardise(self, pa):
         return (pa - self.mean) / self.stdev
 
+    def use_koi(self, **kw):
+        """Run the transformer stack on Dorado's koi kernels (CUDA, inference only).
+        Call after moving the encoder to CUDA; the PyTorch layers stay as the weight source."""
+        from .koi import KoiTxStack
+        lay = self.tx_layer
+        self.koi = KoiTxStack(self.transformer_encoder, lay["nhead"], lay["dim_feedforward"], lay["attn_window"],
+                              lay.get("theta", 10000.0), lay.get("max_seq_len", 4096), **kw)
+        return self
+
     def forward(self, x):
-        return self.transformer_encoder(self.conv(x).transpose(1, 2))
+        h = self.conv(x).transpose(1, 2)
+        if self.koi is not None:
+            return self.koi(h)
+        return self.transformer_encoder(h)
 
 
 def _load_tensor(path):
