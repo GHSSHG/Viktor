@@ -142,3 +142,29 @@ export CUDA_VISIBLE_DEVICES=0    # GPU 2 是同事在用，不要选
 2. **推理补全**：chunk 拼接、完整 read 输出、按位置求边缘概率的质量值。
 3. **RL（GSPO）**：在 SFT 之后进行。
 4. **根据实测结果再决定**：是否需要分页 KV、提前做下一批的 prefill、MQA / FP8 KV、输入帧压缩。
+
+## 7. 进展（2026-10-17，第二轮）
+
+本节取代第 3 节中“固定前缀长度”“流水线只有一套 KV cache”等固定长度的描述。
+
+### 已完成
+
+- **编码器 = Dorado 的 VCS 路径**（`viktor/csrc/koi_tx.cpp`）：移植了 koi 的 VCS 卷积（`koi_vcs_tx_cnn` 及 LUT）、chunk 表、`koi_vcs_attn`、按 chunk 计算的 RoPE 索引表。固定长度路径已删除，因为 A100 上 Dorado 只走 VCS。混合长度的批次和每个 chunk 单独编码，结果逐位相同。
+- **信号预处理 = Dorado ScalerNode**（`viktor/chunking.py`）：int16 原始值转成标准化后的 fp16、开孔电流校正、DNA 开头裁掉 10 个采样点；切块和补齐方式与 Dorado VCS 相同。
+- **解码器支持可变长度**：每条序列有各自的位置，prefill 用拼接格式。
+- **Triton 融合 kernel**（`triton_ops.py`、`fast_decoder.py`）：add+RMSNorm、QK-norm+RoPE+写入 KV cache、SwiGLU。prefill 和解码步共用同一套 kernel，解码步录成 CUDA Graph。
+- **和官方 Dorado 对齐验证**（100 条 HG002 read）：koi VCS 编码器 + koi 束搜索 + mux-change 尾部裁剪，与 Dorado 2.1.2 的编辑距离为 0.059%，31 条逐碱基相同；identity 98.487% 对 98.490%。
+- `tests/gpu_check.py`：kernel、koi VCS、两种解码后端、CUDA Graph 开关的结果一致性，全部通过。
+
+### 测速（batch 512，单位 ms/chunk）
+
+| | 编码器 | prefill | 解码 | 顺序 | 吞吐 |
+|---|---|---|---|---|---|
+| 4-mer，全满长 | 0.978 | 0.595 | 1.583 | 3.156 | 29.7 万 bp/s |
+| 4-mer，Dorado 混合长度 | 0.964 | 0.582 | 1.596 | 3.144 | 29.2 万 bp/s |
+| 单碱基，全满长 | 0.978 | 0.595 | 7.706 | 9.283 | 10.1 万 bp/s |
+| 单碱基，Dorado 混合长度 | 0.964 | 0.583 | 7.753 | 9.303 | 9.9 万 bp/s |
+
+- prefill 从 0.87 ms（torch.compile）降到 0.59 ms。
+- 解码中 79% 的时间在 flash-attn 读 KV cache，带宽利用率约 60%，这是下一步的优化重点。
+- 跨批次流水仍然没有收益。
