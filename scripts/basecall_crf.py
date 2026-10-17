@@ -24,7 +24,7 @@ else:
     import tomli as tomllib
 
 from viktor import load_dorado_encoder
-from viktor.chunking import chunk_read, repeat_pad
+from viktor.chunking import chunk_read, repeat_pad, scale_record
 from viktor.encoder import _load_tensor
 
 STRIDE, NB, NS = 6, 4, 4 ** 5
@@ -122,7 +122,7 @@ def main():
     reads, items = {}, []  # items: (read_id, chunk_idx, start, raw_size, padded signal)
     with pod5.Reader(args.pod5) as r:
         for rec in r.reads():
-            x = enc.standardise(rec.signal_pa.astype(np.float32))
+            x = scale_record(rec, enc.mean, enc.stdev)
             rid = str(rec.read_id)
             spans = chunk_read(len(x), enc.chunksize, enc.overlap)
             reads[rid] = (len(x), len(spans))

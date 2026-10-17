@@ -1,6 +1,6 @@
 """Cut Dorado-style chunks from a pod5 file into an .npz for benchmarking.
 
-Signal is converted to pA and standardised with the model's mean/stdev, then chunked as Dorado's
+Signal is scaled and trimmed as Dorado's ScalerNode does (viktor.chunking.dorado_scale), then chunked as Dorado's
 variable-chunk-size path does (full chunks + a shorter, repeat-padded last chunk per read).
 --full-only keeps only full-size chunks. The .npz holds:
   signal  fp16, all chunks concatenated      lens  samples per chunk
@@ -17,7 +17,7 @@ import sys
 import numpy as np
 import pod5
 
-from viktor.chunking import chunk_read, repeat_pad
+from viktor.chunking import chunk_read, repeat_pad, scale_record
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -46,7 +46,7 @@ def main():
     chunks, new = [], []
     with pod5.Reader(args.pod5) as reader:
         for rec in reader.reads():
-            x = (rec.signal_pa.astype(np.float32) - mean) / stdev
+            x = scale_record(rec, mean, stdev)
             for i, (a, b) in enumerate(chunk_read(len(x), size, overlap)):
                 if args.full_only and b - a != size:
                     continue
