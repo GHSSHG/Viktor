@@ -19,7 +19,6 @@ import numpy as np
 import polars as pl
 import pod5
 import pyarrow as pa
-import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import pysam
 import torch
@@ -79,17 +78,17 @@ def base_weights(r, seq):
 def load_segments(stage6_file, read_ids, segments=SEGMENTS):
     """Stage-6 alignments ('ok' segments) of the given reads: flat uint16 dwell array and {read_id: [(offset, n,
     f_first, f_exit, contig, strand, t_start, t_end), ...]} (dwell of a segment = flat[offset : offset + n - 1])."""
-    ids = pa.array(list(read_ids), pa.string())
+    ids = list(read_ids)
     t = pq.read_table(stage6_file, columns=["read_id", "seg", "n", "f_first", "f_exit", "dwell", "status"])
-    t = t.filter(pc.and_(pc.equal(t["status"], "ok"), pc.is_in(t["read_id"], ids)))
-    dwell = t["dwell"].combine_chunks()
+    dwell = t["dwell"].combine_chunks()  # the whole file, unfiltered: no copy of the ~2 GB dwell column
     flat, offs = dwell.values.to_numpy(zero_copy_only=False), dwell.offsets.to_numpy()
     ref = {(r[0], r[1]): r[2:] for r in pl.scan_parquet(segments)
            .select("read_id", "seg", "contig", "strand", "t_start", "t_end")
-           .filter(pl.col("read_id").is_in(pl.Series(ids.to_pylist()))).collect().iter_rows()}
+           .filter(pl.col("read_id").is_in(ids)).collect().iter_rows()}
     segs = {}
-    for i, (rid, sg, n, f0, fx) in enumerate(zip(*(t[c].to_pylist() for c in ("read_id", "seg", "n", "f_first", "f_exit")))):
-        if (rid, sg) in ref:
+    cols = (t[c].to_pylist() for c in ("read_id", "seg", "n", "f_first", "f_exit", "status"))
+    for i, (rid, sg, n, f0, fx, status) in enumerate(zip(*cols)):
+        if status == "ok" and (rid, sg) in ref:
             segs.setdefault(rid, []).append((int(offs[i]), n, f0, fx, *ref[rid, sg]))
     return flat, segs
 
@@ -153,13 +152,20 @@ class WindowDataset(torch.utils.data.IterableDataset):
                     continue
                 groups = [g.to_dicts() for g in idx.partition_by("read_id")]
                 rng.shuffle(groups)
+                flat = segs = None
                 flat, segs = load_segments(os.path.join(self.stage6, os.path.basename(path)), idx["read_id"].unique())
+                pa.default_memory_pool().release_unused()  # return the previous file's and the read buffers
                 with pod5.Reader(groups[0][0]["pod5"]) as reader:
                     for i in range(0, len(groups), self.reads_per_load):
                         rows = [r for g in groups[i:i + self.reads_per_load] for r in g]
                         for r, x in zip(rows, read_signals(reader, rows, self.mean, self.stdev)):
                             seq = label(fa, r)
-                            buf.append((x, seq, base_weights(r, seq), base_centers(r, flat, segs)))
+                            try:
+                                centers = base_centers(r, flat, segs)
+                            except (AssertionError, KeyError) as e:  # inconsistent alignment: skip the window
+                                print(f"skip window {r['read_id']} {r['win']}: {e!r}", flush=True)
+                                continue
+                            buf.append((x, seq, base_weights(r, seq), centers))
                         while len(buf) >= self.buffer:
                             yield buf.pop(rng.randrange(len(buf)))
 
