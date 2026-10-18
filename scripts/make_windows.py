@@ -43,7 +43,7 @@ import polars as pl
 from viktor.chunking import DNA_TRIM_START, chunk_read
 
 BD = os.path.expanduser("~/Work/BasecallerData")
-POD5_GLOB = "/data_intel/hg002_giab2025.01/pod5/*/*.pod5"
+POD5_GLOB = "/data/hg002_giab2025.01/pod5/*/*.pod5"
 SUPENCODER = os.path.expanduser("~/Work/SUPEncoder")  # forced-alignment code (external)
 SIZE, OVERLAP, FRAME = 12288, 600, 6  # samples per window, Dorado overlap, samples per CRF frame
 MAX_DWELL, MAX_SPB = 200, 40          # stall limit (frames per base), samples per base limit
