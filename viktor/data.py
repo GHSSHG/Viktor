@@ -32,6 +32,7 @@ CRF_FRAME = 6  # signal samples per stage-6 (CRF) frame
 EDGE_WEIGHT = 0.5  # first and last base of a window
 REF = os.path.expanduser("~/Work/BasecallerData/reference/hg002v1.2.fa")
 STAGE6 = os.path.expanduser("~/Work/BasecallerData/stage6_align")
+SEGMENTS = os.path.expanduser("~/Work/BasecallerData/inventory/truth_segments_nocigar.parquet")
 _COMP = str.maketrans("ACGTN", "TGCAN")
 
 
@@ -75,25 +76,33 @@ def base_weights(r, seq):
     return w
 
 
-def load_segments(stage6_file, read_ids):
-    """Stage-6 alignments ('ok' segments) of the given reads: flat uint16 dwell array and
-    {read_id: [(offset, n, f_first, f_exit), ...]} (dwell of a segment = flat[offset : offset + n - 1])."""
-    t = pq.read_table(stage6_file, columns=["read_id", "n", "f_first", "f_exit", "dwell", "status"])
-    t = t.filter(pc.and_(pc.equal(t["status"], "ok"), pc.is_in(t["read_id"], pa.array(list(read_ids), pa.string()))))
+def load_segments(stage6_file, read_ids, segments=SEGMENTS):
+    """Stage-6 alignments ('ok' segments) of the given reads: flat uint16 dwell array and {read_id: [(offset, n,
+    f_first, f_exit, contig, strand, t_start, t_end), ...]} (dwell of a segment = flat[offset : offset + n - 1])."""
+    ids = pa.array(list(read_ids), pa.string())
+    t = pq.read_table(stage6_file, columns=["read_id", "seg", "n", "f_first", "f_exit", "dwell", "status"])
+    t = t.filter(pc.and_(pc.equal(t["status"], "ok"), pc.is_in(t["read_id"], ids)))
     dwell = t["dwell"].combine_chunks()
     flat, offs = dwell.values.to_numpy(zero_copy_only=False), dwell.offsets.to_numpy()
+    ref = {(r[0], r[1]): r[2:] for r in pl.scan_parquet(segments)
+           .select("read_id", "seg", "contig", "strand", "t_start", "t_end")
+           .filter(pl.col("read_id").is_in(pl.Series(ids.to_pylist()))).collect().iter_rows()}
     segs = {}
-    for i, (rid, n, f0, fx) in enumerate(zip(*(t[c].to_pylist() for c in ("read_id", "n", "f_first", "f_exit")))):
-        segs.setdefault(rid, []).append((int(offs[i]), n, f0, fx))
+    for i, (rid, sg, n, f0, fx) in enumerate(zip(*(t[c].to_pylist() for c in ("read_id", "seg", "n", "f_first", "f_exit")))):
+        if (rid, sg) in ref:
+            segs.setdefault(rid, []).append((int(offs[i]), n, f0, fx, *ref[rid, sg]))
     return flat, segs
 
 
 def base_centers(r, flat, segs):
     """Window-local encoder frame of each label base's signal midpoint (read order), as make_windows.window_rows
-    derives the label: base i enters at CRF frame e_i = f_first + cumsum(dwell), midpoint 3 * (e_i + e_{i+1})."""
+    derives the label: base i enters at CRF frame e_i = f_first + cumsum(dwell), midpoint 3 * (e_i + e_{i+1}).
+    The segment is the one holding the window in both signal and reference (segments of fold-back reads overlap
+    in signal)."""
     A = r["win"] + DNA_TRIM_START  # window start in child-read samples
-    for off, n, f0, fx in segs[r["read_id"]]:
-        if CRF_FRAME * f0 <= A and A + SIZE <= CRF_FRAME * (fx + 1):
+    for off, n, f0, fx, contig, strand, t0, t1 in segs[r["read_id"]]:
+        if (CRF_FRAME * f0 <= A and A + SIZE <= CRF_FRAME * (fx + 1) and contig == r["contig"]
+                and strand == r["strand"] and t0 <= r["g_lo"] and r["g_hi"] <= t1):
             e = np.empty(n + 1, np.int64)
             e[0], e[n] = f0, fx + 1
             e[1:n] = f0 + np.cumsum(flat[off:off + n - 1], dtype=np.int64)
