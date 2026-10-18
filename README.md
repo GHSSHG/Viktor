@@ -29,7 +29,8 @@ pod5 int16 信号
 | `viktor/decode_attention.py` | 单 query 的 GQA 解码 attention（sm80 默认使用） |
 | `viktor/data.py` | 训练窗口：在线读 pod5 信号（与推理相同的预处理）、从参考取标签、逐碱基权重、`WindowDataset` |
 | `scripts/make_chunks.py` | pod5 → chunk 集 `.npz`（signal、lens、valid、new），测速用 |
-| `scripts/make_windows.py` | 训练数据：从 BasecallerData 第 6 阶段的强制比对结果切出 Dorado 式 12288 点窗口的索引（`build`），并用 Dorado CRF 抽查标签（`check`） |
+| `scripts/make_windows.py` | 训练数据：从 BasecallerData 第 6 阶段的强制比对结果切出 Dorado 式 12288 点窗口的索引（`build`），并用 Dorado CRF 抽查标签（`check`）；外部测试集（`external`，如 EF22 细菌，用 SUPEncoder 的强制比对） |
+| `scripts/evaluate.py` | 检查点 + Dorado 基线在固定窗口集上的自由解码评估（口径同训练中的 heldout 评估） |
 | `scripts/train.py` | 第一阶段 SFT：koi 编码器冻结，单碱基 decoder 从头训练 1 个 epoch；DDP、torch.compile、WSD、wandb、温度保护 |
 | `scripts/bench.py` | 端到端测速：编码器、prefill、解码各阶段与总吞吐 |
 | `scripts/basecall_crf.py`, `score_paf.py` | 对照路径：koi 编码器 + Dorado CRF 头 + koi 束搜索 + Dorado 拼接，用 minimap2 PAF 打分。用于证明编码器和预处理与 Dorado 一致 |
@@ -59,8 +60,15 @@ CUDA_VISIBLE_DEVICES=0 python -m scripts.bench --model-dir $MODEL --tokenizer ba
 python -m scripts.make_windows build --out ~/Work/BasecallerData/viktor_win12288 --workers 16
 CUDA_VISIBLE_DEVICES=0 python -m scripts.make_windows check --out ~/Work/BasecallerData/viktor_win12288 --model-dir $MODEL
 
+# 外部测试集（EF22 细菌，1024 个窗口）与评估
+CUDA_VISIBLE_DEVICES=3 python -m scripts.make_windows external --pod5 /data_nvme/bacteria_ef22/pod5/EF22_main.pod5 \
+    --paf /data_nvme/bacteria_ef22/basecalls/ef22_main.paf --ref /data_nvme/bacteria_ef22/reference/ef22_ref.fasta \
+    --contigs contig_1 --out ~/Work/BasecallerData/viktor_ef22_n1024.parquet --n 1024
+CUDA_VISIBLE_DEVICES=3 python -m scripts.evaluate --model-dir $MODEL --windows ~/Work/BasecallerData/viktor_ef22_n1024.parquet \
+    --ref /data_nvme/bacteria_ef22/reference/ef22_ref.fasta --out runs/eval_ef22.json runs/sft2/snap_0030000.pt
+
 # 训练（4 卡，1 个 epoch）
-torchrun --nproc-per-node 4 -m scripts.train --model-dir $MODEL --windows ~/Work/BasecallerData/viktor_win12288 --out runs/sft1
+torchrun --nproc-per-node 4 -m scripts.train --model-dir $MODEL --windows ~/Work/BasecallerData/viktor_win12288 --out runs/sft2
 
 # 检查
 python -m pytest tests/test_viktor.py
