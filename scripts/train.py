@@ -109,7 +109,8 @@ def temperature_guard(rank, dev, pause, resume, wait=10):
 def masked_identity(pred, ref, scored):
     """Identity over scored reference bases (as SUPEncoder eval_free9): NW path; a mismatch or deletion counts
     against its reference base, an insertion against the reference base before it."""
-    cig = edlib.align(pred, ref, mode="NW", task="path")["cigar"]
+    # an empty call has no edlib path (cigar None): every reference base is deleted
+    cig = edlib.align(pred, ref, mode="NW", task="path")["cigar"] or f"{len(ref)}D"
     ri, err, num = 0, 0, ""
     for ch in cig:
         if ch.isdigit():
