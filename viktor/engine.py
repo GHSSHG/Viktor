@@ -1,4 +1,5 @@
-"""Greedy decoding for variable-length chunks: static KV cache, packed prefill, one CUDA graph per step.
+"""Greedy (or sampled, temperature > 0) decoding for variable-length chunks: static KV cache, packed prefill, one CUDA
+graph per step. Sampling uses the Gumbel-max trick (argmax of logits / temperature + Gumbel noise), graph-safe.
 
 Each sequence's prefix is the encoder frames of its chunk's real signal + BOS, so prefix lengths differ
 and every sequence decodes at its own position. Finished sequences keep running and emit PAD, which
@@ -28,8 +29,9 @@ def _triton_available():
 class DecodeEngine:
     def __init__(self, model: Basecaller, batch_size: int, max_new_tokens: int, max_frames: int,
                  backend: str = "auto", cuda_graph: bool = True, prefill_batch: int = 128, check_every: int = 32,
-                 attention_backend: str = "auto"):
+                 attention_backend: str = "auto", temperature: float = 0.0):
         self.model, self.dec = model, model.decoder
+        self.temperature = temperature
         dev = self.dec.lm_head.weight.device
         self.dtype = self.dec.lm_head.weight.dtype
         if backend == "auto":
@@ -62,7 +64,10 @@ class DecodeEngine:
             self._capture()
 
     def _select(self, logits, prev):
-        nxt = (logits.float() + self.bias).argmax(-1)
+        z = logits.float() + self.bias
+        if self.temperature > 0:
+            z = z / self.temperature - torch.log(-torch.log(torch.rand_like(z).clamp_(min=1e-20)))
+        nxt = z.argmax(-1)
         nxt = torch.where(self.is_tail[prev], torch.full_like(nxt, EOS), nxt)  # a tail must be last
         stop = (prev == EOS) | (prev == PAD)
         return torch.where(stop, torch.full_like(nxt, PAD), nxt)
