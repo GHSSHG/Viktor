@@ -6,9 +6,18 @@ Loss: weighted token cross-entropy + --align-weight x attention alignment loss (
 attention over the signal prefix pulled towards each base's forced-alignment frame; training only).
 Training and validation windows exclude low-quality reads (data.split_rows); the chr20 heldout set keeps them.
 
-Schedule: WSD (linear warmup, constant, 1 - sqrt decay to 0 over the last --decay-frac of the steps).
+Data: --windows takes one or more make_windows.py indexes as DIR[:PART[:WEIGHT]] (PART a viktor.data.PARTS source,
+default part1; WEIGHT the share of training windows drawn from it, default 1).
+
+Schedule: WSD (linear warmup, constant, 1 - sqrt decay to 0 over the last --decay-frac of the steps). With
+--decay-start the decay instead starts at that step and runs --decay-steps; training stops at its end, and a
+resumable copy of the state just before the decay is kept as OUT/predecay_<step>.pt. Without it (and with --init)
+the learning rate stays at --lr until --max-steps, so the decay can be scheduled later by resuming with
+--decay-start. --init starts a new run (own OUT, own wandb run) from another run's resumable checkpoint
+(projector, decoder, optimizer state, step).
 Logged to wandb (rank 0) every --log-every steps, including each GPU's temperature / SM clock / power.
-  val      every --val-every steps: teacher-forced weighted loss / base accuracy on fixed 'val' windows
+  val      every --val-every steps: teacher-forced weighted loss / base accuracy on fixed 'val' windows of every
+           source (val/<part>/loss, val/<part>/acc; the first source also as val/loss, val/acc)
   heldout  at every checkpoint (--ckpt-every): free greedy decoding (DecodeEngine on a bf16 copy) of fixed
            chr20 windows: global identity (edlib NW), identity over scored bases, derailed fraction (< 0.9).
            The Dorado SUP baseline on the same windows (koi encoder + CRF head + koi beam search) is computed
@@ -17,8 +26,11 @@ Checkpoints: OUT/last.pt (resumable, optimizer + wandb run id, resumed automatic
 OUT/snap_<step>.pt. Temperature guard: when any GPU reaches --temp-pause degC all ranks wait until every GPU
 is at or below --temp-resume.
 
-Example:
+Examples:
   torchrun --nproc-per-node 4 -m scripts.train --model-dir MODEL --windows ~/Work/BasecallerData/viktor_win12288 --out runs/sft1
+  torchrun --nproc-per-node 4 -m scripts.train --model-dir MODEL --init runs/sft2/predecay_600000.pt --max-steps 650000 \
+      --windows ~/Work/BasecallerData/viktor_win12288_part2:part2:0.75 ~/Work/BasecallerData/viktor_win12288_bact:bact:0.25 \
+      --out runs/sft3
 """
 
 import argparse
@@ -26,6 +38,7 @@ import copy
 import json
 import math
 import os
+import shutil
 import time
 
 import edlib
@@ -37,7 +50,7 @@ import torch.nn as nn
 
 from viktor import Basecaller, DecodeEngine, get_tokenizer, load_dorado_encoder
 from viktor.model import AlignConfig
-from viktor.data import WindowDataset, collate, index_files, load_windows, split_rows
+from viktor.data import MixedDataset, WindowDataset, collate, index_files, load_windows, part_paths, split_rows
 
 
 class Trainable(nn.Module):
@@ -52,13 +65,21 @@ class Trainable(nn.Module):
         return self._model[0].weighted_loss(frames, tokens_in, targets, w, centers)
 
 
-def wsd(step, total, peak, warmup, decay_frac):
-    decay_start = int(total * (1 - decay_frac))
+def wsd(step, total, peak, warmup, decay_frac, decay_start=None):
+    """decay_start None: decay over the last decay_frac of total; else from decay_start over total - decay_start."""
+    if decay_start is None:
+        decay_start = int(total * (1 - decay_frac))
     if step < warmup:
         return peak * (step + 1) / warmup
     if step < decay_start:
         return peak
     return peak * (1 - math.sqrt((step - decay_start) / max(1, total - decay_start)))
+
+
+def parse_source(spec):
+    """DIR[:PART[:WEIGHT]] -> (index dir, part, weight)."""
+    d, part, w = (spec.split(":") + ["", ""])[:3]
+    return d, part or "part1", float(w or 1)
 
 
 def gpu_stats():
@@ -114,12 +135,12 @@ def identity_stats(preds, wins):
             "masked_median": float(np.median(masked))}
 
 
-def fixed_windows(index_dir, split, n, mean, stdev):
+def fixed_windows(index_dir, split, n, mean, stdev, part="part1"):
     """n windows of one split, sampled deterministically from a few index files."""
     files = index_files(index_dir)
     pick = np.random.default_rng(1).choice(len(files), min(8, len(files)), replace=False)
     idx = pl.concat([split_rows(pl.read_parquet(files[i]), split) for i in pick])
-    return load_windows(idx.sample(min(n, idx.height), seed=1).to_dicts(), mean, stdev)
+    return load_windows(idx.sample(min(n, idx.height), seed=1).to_dicts(), mean, stdev, part_paths(part)[0])
 
 
 @torch.no_grad()
@@ -138,7 +159,7 @@ def dorado_calls(model_dir, encoder, wins, dev):
 
 
 @torch.no_grad()
-def eval_val(model, val, batch, dev):
+def eval_val(model, val, batch, dev, prefix="val"):
     model.eval()
     loss = correct = scored = 0.0
     for i in range(0, len(val), batch):
@@ -148,7 +169,7 @@ def eval_val(model, val, batch, dev):
             l, _, _, c, s = model.frame_loss(model.encoder(sig.to(dev)), seqs, ws)
         loss, correct, scored = loss + float(l) * len(g), correct + float(c), scored + float(s)
     model.train()
-    return {"val/loss": loss / len(val), "val/acc": correct / scored}
+    return {f"{prefix}/loss": loss / len(val), f"{prefix}/acc": correct / scored}
 
 
 @torch.no_grad()
@@ -174,13 +195,16 @@ def eval_heldout(model, heldout, batch, dev):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-dir", required=True)
-    ap.add_argument("--windows", required=True, help="make_windows.py output dir")
+    ap.add_argument("--windows", required=True, nargs="+", help="make_windows.py output dirs, DIR[:PART[:WEIGHT]]")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--init", help="start from this resumable checkpoint (other run's last.pt / predecay_*.pt)")
     ap.add_argument("--batch", type=int, default=32, help="windows per GPU per step")
     ap.add_argument("--max-steps", type=int, default=None, help="stop early (smoke tests); default one epoch")
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--warmup", type=int, default=2000)
     ap.add_argument("--decay-frac", type=float, default=0.2, help="WSD: fraction of steps in the final decay")
+    ap.add_argument("--decay-start", type=int, default=None, help="WSD: decay from this step (instead of --decay-frac)")
+    ap.add_argument("--decay-steps", type=int, default=250_000, help="WSD with --decay-start: decay length")
     ap.add_argument("--weight-decay", type=float, default=0.1)
     ap.add_argument("--clip", type=float, default=1.0)
     ap.add_argument("--pad-to", type=int, default=128, help="pad label lengths to a multiple (compile shapes)")
@@ -210,8 +234,16 @@ def main():
     torch._dynamo.config.cache_size_limit = 64
     os.makedirs(args.out, exist_ok=True)
 
-    n_train = split_rows(pl.scan_parquet(index_files(args.windows)), "train").select(pl.len()).collect().item()
+    sources = [parse_source(s) for s in args.windows]
+    n_train = sum(split_rows(pl.scan_parquet(index_files(d)), "train").select(pl.len()).collect().item()
+                  for d, _, _ in sources)
     total = n_train // (args.batch * world)  # one epoch
+    decay_start = args.decay_start
+    if decay_start is not None:
+        total = decay_start + args.decay_steps
+    elif args.init:  # constant learning rate until --max-steps
+        assert args.max_steps, "--init needs --decay-start or --max-steps"
+        total = decay_start = args.max_steps
     stop = min(total, args.max_steps or total)
 
     encoder = load_dorado_encoder(args.model_dir).to(dev, torch.float16).eval().use_koi()
@@ -229,16 +261,21 @@ def main():
                              {"params": no_decay, "weight_decay": 0.0}], lr=args.lr, betas=(0.9, 0.95), fused=True)
     step, run_id = 0, None
     ckpt = os.path.join(args.out, "last.pt")
-    if os.path.exists(ckpt):
-        s = torch.load(ckpt, map_location=dev, weights_only=False)
+    start = ckpt if os.path.exists(ckpt) else args.init
+    if start:
+        s = torch.load(start, map_location=dev, weights_only=False)
         model.projector.load_state_dict(s["projector"])
         model.decoder.load_state_dict(s["decoder"])
         opt.load_state_dict(s["opt"])
-        step, run_id = s["step"], s.get("wandb_id")
+        step = s["step"]
+        run_id = s.get("wandb_id") if start == ckpt else None
     ddp = nn.parallel.DistributedDataParallel(trainable, device_ids=[dev.index])
     step_fn = ddp if args.no_compile else torch.compile(ddp, dynamic=False)  # one graph per --pad-to length
 
-    ds = WindowDataset(args.windows, "train", encoder.mean, encoder.stdev, rank, world, seed=args.seed * 1000 + step)
+    seed = args.seed * 1000 + step
+    parts = [WindowDataset(d, "train", encoder.mean, encoder.stdev, rank, world, seed, *part_paths(part))
+             for d, part, _ in sources]
+    ds = parts[0] if len(parts) == 1 else MixedDataset(parts, [w for _, _, w in sources], seed)
     dl = torch.utils.data.DataLoader(ds, batch_size=args.batch, collate_fn=collate, num_workers=args.workers,
                                      prefetch_factor=4, persistent_workers=True, pin_memory=True,
                                      multiprocessing_context="spawn")  # polars/pod5 threads do not survive fork
@@ -253,8 +290,8 @@ def main():
         run_id = wb.id
         print(f"world {world}, {n_par / 1e6:.2f}M trainable, {n_train} train windows = {total} steps/epoch, "
               f"start at {step}, stop at {stop}", flush=True)
-        val = fixed_windows(args.windows, "val", args.eval_n, encoder.mean, encoder.stdev)
-        heldout = fixed_windows(args.windows, "heldout", args.eval_n, encoder.mean, encoder.stdev)
+        val = {part: fixed_windows(d, "val", args.eval_n, encoder.mean, encoder.stdev, part) for d, part, _ in sources}
+        heldout = fixed_windows(sources[0][0], "heldout", args.eval_n, encoder.mean, encoder.stdev, sources[0][1])
         base = os.path.join(args.out, "dorado.json")
         if not os.path.exists(base):
             with open(base, "w") as f:
@@ -275,7 +312,10 @@ def main():
     for sig, seqs, ws, cs in dl:
         if step >= stop:
             break
-        lr = wsd(step, total, args.lr, args.warmup, args.decay_frac)
+        if step == decay_start and rank == 0 and not os.path.exists(os.path.join(args.out, f"predecay_{step}.pt")):
+            save()
+            shutil.copyfile(ckpt, os.path.join(args.out, f"predecay_{step}.pt"))
+        lr = wsd(step, total, args.lr, args.warmup, args.decay_frac, decay_start)
         for g in opt.param_groups:
             g["lr"] = lr
         tokens_in, targets, w, centers = (t.to(dev, non_blocking=True) for t in model.batch(seqs, ws, args.pad_to, cs))
@@ -308,7 +348,12 @@ def main():
                       f"{rec['s_per_step']:.3f} s/step {rec['bases_per_s']:.0f} bases/s", flush=True)
             t0, paused, acc = time.time(), 0.0, torch.zeros(6, device=dev)
         if step % args.val_every == 0 and rank == 0:
-            wb.log(eval_val(model, val, 64, dev), step=step)
+            rec = {}
+            for i, (part, v) in enumerate(val.items()):
+                rec |= eval_val(model, v, 64, dev, f"val/{part}")
+                if i == 0:
+                    rec |= {"val/loss": rec[f"val/{part}/loss"], "val/acc": rec[f"val/{part}/acc"]}
+            wb.log(rec, step=step)
         if step % args.ckpt_every == 0 or step == stop:
             if rank == 0:
                 save()

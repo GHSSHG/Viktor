@@ -9,6 +9,8 @@ from the same stage-6 forced alignment make_windows.py used (stage-6 file of the
 alignment loss.
 Training and validation use only windows of full-quality reads (read weight w == 1); the chr20 'heldout'
 test set keeps every read, so it stays the same for every model compared on it.
+PARTS lists the BasecallerData sources (HG002 part 1, HG002 part 2, the Sowpati bacteria); MixedDataset draws
+from several of them with fixed probabilities.
 """
 
 import glob
@@ -29,9 +31,29 @@ SIZE = 12288
 STRIDE = 12  # signal samples per encoder frame
 CRF_FRAME = 6  # signal samples per stage-6 (CRF) frame
 EDGE_WEIGHT = 0.5  # first and last base of a window
-REF = os.path.expanduser("~/Work/BasecallerData/reference/hg002v1.2.fa")
-STAGE6 = os.path.expanduser("~/Work/BasecallerData/stage6_align")
-SEGMENTS = os.path.expanduser("~/Work/BasecallerData/inventory/truth_segments_nocigar.parquet")
+BD = os.path.expanduser("~/Work/BasecallerData")
+# source -> BasecallerData table prefix, stage-6 dir, reference, pod5 glob, chimera mask table (same dirs as
+# BasecallerData/scripts/stage6_forced_align.py)
+PARTS = {
+    "part1": dict(prefix="", stage6="stage6_align", ref="reference/hg002v1.2.fa",
+                  pod5="/data/hg002_giab2025.01/pod5/*/*.pod5", chimera="chimera_bp_v2"),
+    "part2": dict(prefix="part2_", stage6="stage6_part2", ref="reference/hg002v1.2.fa",
+                  pod5="/data/hg002_giab2025.01_more/pod5/*/*.pod5", chimera="part2_chimera_bp"),
+    "part3": dict(prefix="part3_", stage6="stage6_part3", ref="reference/hg002v1.2.fa",
+                  pod5="/data/hg002_giab2025.01_rest/pod5/*/*.pod5", chimera="part3_chimera_bp"),
+    "bact": dict(prefix="bact_", stage6="stage6_bact", ref="reference/bacteria_sft3.fa",
+                 pod5="/data_intel/sowpati_basemod/Raw/pod5/bacteria/*/*.pod5", chimera="bact_chimera_bp"),
+}
+
+
+def part_paths(part):
+    """(reference FASTA, stage-6 dir, truth segment table) of a source."""
+    p = PARTS[part]
+    return (os.path.join(BD, p["ref"]), os.path.join(BD, p["stage6"]),
+            os.path.join(BD, "inventory", p["prefix"] + "truth_segments_nocigar.parquet"))
+
+
+REF, STAGE6, SEGMENTS = part_paths("part1")
 _COMP = str.maketrans("ACGTN", "TGCAN")
 
 
@@ -132,8 +154,9 @@ class WindowDataset(torch.utils.data.IterableDataset):
     reshuffled every pass."""
 
     def __init__(self, index_dir, split, mean, stdev, rank=0, world=1, seed=0, ref=REF, stage6=STAGE6,
-                 reads_per_load=32, buffer=4096):
+                 segments=SEGMENTS, reads_per_load=32, buffer=4096):
         self.files, self.split, self.ref, self.stage6 = index_files(index_dir), split, ref, stage6
+        self.segments = segments
         self.mean, self.stdev, self.rank, self.world, self.seed = mean, stdev, rank, world, seed
         self.reads_per_load, self.buffer = reads_per_load, buffer
 
@@ -153,7 +176,8 @@ class WindowDataset(torch.utils.data.IterableDataset):
                 groups = [g.to_dicts() for g in idx.partition_by("read_id")]
                 rng.shuffle(groups)
                 flat = segs = None
-                flat, segs = load_segments(os.path.join(self.stage6, os.path.basename(path)), idx["read_id"].unique())
+                flat, segs = load_segments(os.path.join(self.stage6, os.path.basename(path)), idx["read_id"].unique(),
+                                           self.segments)
                 pa.default_memory_pool().release_unused()  # return the previous file's and the read buffers
                 with pod5.Reader(groups[0][0]["pod5"]) as reader:
                     for i in range(0, len(groups), self.reads_per_load):
@@ -168,6 +192,21 @@ class WindowDataset(torch.utils.data.IterableDataset):
                             buf.append((x, seq, base_weights(r, seq), centers))
                         while len(buf) >= self.buffer:
                             yield buf.pop(rng.randrange(len(buf)))
+
+
+class MixedDataset(torch.utils.data.IterableDataset):
+    """Yields WindowDataset items, each drawn from source i with probability weights[i] (every source streams
+    on its own, with its own shuffle buffer)."""
+
+    def __init__(self, datasets, weights, seed=0):
+        self.datasets, self.weights, self.seed = datasets, weights, seed
+
+    def __iter__(self):
+        wi = torch.utils.data.get_worker_info()
+        rng = random.Random(self.seed * 100003 + 7919 * (wi.id if wi else 0) + self.datasets[0].rank)
+        its = [iter(d) for d in self.datasets]
+        while True:
+            yield next(rng.choices(its, self.weights)[0])
 
 
 def collate(items):

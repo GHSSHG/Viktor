@@ -1,4 +1,5 @@
-"""Training windows from BasecallerData (HG002 part 1): Dorado-style 12288-sample chunks with reference labels.
+"""Training windows from BasecallerData (--part: HG002 part 1 / part 2 / part 3, Sowpati bacteria; tables, stage-6 dir and
+pod5 files from viktor.data.PARTS): Dorado-style 12288-sample chunks with reference labels.
 
 Labels come from the stage-6 CRF forced alignment of the T2T HG002 Q100 v1.2 reference to each read
 segment: base i of a segment enters at CRF frame e_i (f_first + cumsum(dwell)), i.e. child-read sample 6*e_i.
@@ -18,6 +19,7 @@ One parquet per pod5 file, one row per window:
 
 Examples:
   python -m scripts.make_windows build --out ~/Work/BasecallerData/viktor_win12288 --workers 16   # CPU only
+  python -m scripts.make_windows build --part bact --out ~/Work/BasecallerData/viktor_win12288_bact
   CUDA_VISIBLE_DEVICES=0 python -m scripts.make_windows check --out DIR --model-dir MODEL --n 4000
 check basecalls sampled windows with the koi encoder + Dorado CRF head + koi beam search and reports the
 global identity of each call against its label (wrong coordinates show up as low identity).
@@ -35,36 +37,43 @@ import glob
 import json
 import multiprocessing as mp
 import os
+import sys
 import time
 
 import numpy as np
 import polars as pl
 
 from viktor.chunking import DNA_TRIM_START, chunk_read
+from viktor.data import BD, PARTS
 
-BD = os.path.expanduser("~/Work/BasecallerData")
-POD5_GLOB = "/data/hg002_giab2025.01/pod5/*/*.pod5"
+sys.path.insert(0, os.path.join(BD, "scripts"))
+from placement import flag_misplaced  # noqa: E402
+
 SUPENCODER = os.path.expanduser("~/Work/SUPEncoder")  # forced-alignment code (external)
 SIZE, OVERLAP, FRAME = 12288, 600, 6  # samples per window, Dorado overlap, samples per CRF frame
 MAX_DWELL, MAX_SPB = 200, 40          # stall limit (frames per base), samples per base limit
 HOLDOUT = "chr20_"
 
 
-def load_meta():
-    """Per-segment metadata of usable segments, and all masks in reference coordinates."""
-    seg = (pl.read_parquet(f"{BD}/inventory/truth_segments_nocigar.parquet",
-                           columns=["read_id", "seg", "contig", "strand", "t_start", "t_end"])
-           .join(pl.read_parquet(f"{BD}/masks/segments_keep.parquet").filter(pl.col("keep")).drop("keep"),
+def load_meta(part="part1"):
+    """Per-segment metadata of usable segments, and all masks in reference coordinates.
+    part1: misplaced segments come from masks/misplaced_stage6_align.parquet; the other parts use their own
+    tables (all with the corrected v2 mask logic) and flag misplaced segments per file in process()."""
+    P = PARTS[part]["prefix"]
+    seg = (pl.read_parquet(f"{BD}/inventory/{P}truth_segments_nocigar.parquet",
+                           columns=["read_id", "seg", "contig", "strand", "t_start", "t_end", "q_start", "q_end", "qlen"])
+           .join(pl.read_parquet(f"{BD}/masks/{P}segments_keep.parquet").filter(pl.col("keep")).drop("keep"),
                  on=["read_id", "seg"])
-           .join(pl.read_parquet(f"{BD}/masks/misplaced_stage6_align.parquet", columns=["read_id", "seg"]),
-                 on=["read_id", "seg"], how="anti")
-           .join(pl.read_parquet(f"{BD}/inventory/bam_reads.parquet",
-                                 columns=["read_id", "parent_id", "split_start", "num_samples", "pod5_file"]), on="read_id")
-           .join(pl.read_parquet(f"{BD}/inventory/read_qc.parquet", columns=["read_id", "w_channel"]), on="read_id")
-           .join(pl.read_parquet(f"{BD}/masks/split.parquet"), on="read_id"))
-    masks = pl.concat([pl.read_parquet(f"{BD}/masks/het_ambig.parquet"),
-                       pl.read_parquet(f"{BD}/masks/chimera_bp_v2.parquet")])
-    patch = pl.read_parquet(f"{BD}/masks/patch_global_v2.parquet")
+           .join(pl.read_parquet(f"{BD}/inventory/{P}bam_reads.parquet",
+                                 columns=["read_id", "parent_id", "split_start", "num_samples", "trim_start", "pod5_file"]), on="read_id")
+           .join(pl.read_parquet(f"{BD}/inventory/{P}read_qc.parquet", columns=["read_id", "w_channel"]), on="read_id")
+           .join(pl.read_parquet(f"{BD}/masks/{P}split.parquet"), on="read_id"))
+    if part == "part1":
+        seg = seg.join(pl.read_parquet(f"{BD}/masks/misplaced_stage6_align.parquet", columns=["read_id", "seg"]),
+                       on=["read_id", "seg"], how="anti")
+    masks = pl.concat([pl.read_parquet(f"{BD}/masks/{P}het_ambig.parquet"),
+                       pl.read_parquet(f"{BD}/masks/{PARTS[part]['chimera']}.parquet")])
+    patch = pl.read_parquet(f"{BD}/masks/patch_global_v2.parquet")  # same 612 intervals for every part
     return seg, masks, patch
 
 
@@ -107,11 +116,16 @@ def window_rows(r, dwell, seg_masks, patch):
 
 
 def process(job):
-    path, out, seg, masks, patch, pod5_paths = job
+    path, out, seg, masks, patch, pod5_paths, flag_part = job
     t = time.time()
     name = os.path.basename(path)[:-len(".parquet")]
-    s6 = (pl.read_parquet(path, columns=["read_id", "seg", "n", "f_first", "f_exit", "dwell", "status"])
-          .filter(pl.col("status") == "ok").drop("status").join(seg, on=["read_id", "seg"]))
+    raw = pl.read_parquet(path, columns=["read_id", "seg", "n", "f_first", "f_exit", "dwell", "status", "deficit"])
+    if flag_part:  # part2/3: drop misplaced segments (scripts/placement.py), as filter_misplaced.py did for part 1
+        sq = seg.select("read_id", "seg", "q_start", "q_end", "qlen")
+        bam = seg.select("read_id", "num_samples", "trim_start").unique("read_id")
+        bad = flag_misplaced(raw.drop("dwell"), sq, bam).select("read_id", "seg")
+        raw = raw.join(bad, on=["read_id", "seg"], how="anti")
+    s6 = (raw.filter(pl.col("status") == "ok").drop("status", "deficit").join(seg, on=["read_id", "seg"]))
     lens = s6["dwell"].list.len().fill_null(0).to_numpy().astype(np.int64)
     flat = s6["dwell"].explode().drop_nulls().to_numpy()
     offs = np.concatenate([[0], np.cumsum(lens)])
@@ -205,7 +219,8 @@ def external(args):
         if te - ts < 2 * SIZE // 10 or (qe - qs) / qlen < 0.9 or ts < 10 or te > clen[f[5]] - 10:
             continue
         al[f[0]] = dict(contig=f[5], strand=f[4], t_start=ts, t_end=te)
-    keep = [r for r in al if n_prim[r] == 1]  # several primary-type alignments = chimeric read
+    skip_ids = set(pl.read_parquet(args.exclude, columns=["read_id"])["read_id"]) if args.exclude else set()
+    keep = [r for r in al if n_prim[r] == 1 and r not in skip_ids]  # several primary-type alignments = chimeric read
     rng.shuffle(keep)
     keep = keep[:args.reads]
     sig = {}
@@ -292,7 +307,7 @@ def external(args):
                 for key, v in (("read_id", r), ("parent_id", r), ("pod5", os.path.abspath(args.pod5)),
                                ("split_start", 0), ("num_samples", len(sig[r])), ("win", a), ("contig", g["contig"]),
                                ("strand", g["strand"]), ("g_lo", g_lo), ("g_hi", g_hi), ("n_bases", nb),
-                               ("mask_lo", []), ("mask_hi", []), ("w", 1.0), ("split", "external")):
+                               ("mask_lo", []), ("mask_hi", []), ("w", 1.0), ("split", args.split)):
                     cols[key].append(v)
         print(f"reads {b0 + len(ids)}, windows {len(cols['win'])}, {stats}", flush=True)
     df = pl.DataFrame(cols, schema_overrides={"win": pl.Int32, "n_bases": pl.Int32, "w": pl.Float32,
@@ -304,6 +319,7 @@ def external(args):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=["build", "check", "external"])
+    ap.add_argument("--part", default="part1", choices=sorted(PARTS), help="build: BasecallerData source")
     ap.add_argument("--out", required=True)
     ap.add_argument("--workers", type=int, default=16)
     ap.add_argument("--limit", type=int, default=None, help="build: only the first N stage-6 files (testing)")
@@ -317,6 +333,8 @@ def main():
     ap.add_argument("--per-read", type=int, default=2, help="external: windows per read")
     ap.add_argument("--max-samples", type=int, default=400_000, help="external: skip longer reads")
     ap.add_argument("--batch", type=int, default=4, help="external: reads per forced-alignment batch")
+    ap.add_argument("--exclude", help="external: parquet with read_id; those reads are skipped (e.g. the test set)")
+    ap.add_argument("--split", default="external", help="external: split label (train for training windows)")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
     if args.cmd == "check":
@@ -325,14 +343,14 @@ def main():
         return external(args)
     os.makedirs(args.out, exist_ok=True)
     t = time.time()
-    seg, masks, patch = load_meta()
-    pod5_paths = {os.path.basename(p): p for p in glob.glob(POD5_GLOB)}
-    files = sorted(glob.glob(f"{BD}/stage6_align/*.parquet"))[:args.limit]
+    seg, masks, patch = load_meta(args.part)
+    pod5_paths = {os.path.basename(p): p for p in glob.glob(PARTS[args.part]["pod5"])}
+    files = sorted(glob.glob(f"{BD}/{PARTS[args.part]['stage6']}/*.parquet"))[:args.limit]
     jobs = []
     for f in files:
         pod5 = os.path.basename(f)[:-len(".parquet")]
         part = seg.filter(pl.col("pod5_file") == pod5)
-        jobs.append((f, args.out, part, masks.filter(pl.col("read_id").is_in(part["read_id"].implode())), patch, pod5_paths))
+        jobs.append((f, args.out, part, masks.filter(pl.col("read_id").is_in(part["read_id"].implode())), patch, pod5_paths, args.part != "part1"))
     print(f"metadata {seg.height} segments, {len(files)} files, {time.time() - t:.0f} s", flush=True)
     stats = []
     with mp.get_context("spawn").Pool(args.workers) as pool:
@@ -342,7 +360,7 @@ def main():
     tot = {k: sum(s[k] for s in stats) for k in ("segments", "windows", "bases", "outside", "stall", "few_bases")}
     with open(os.path.join(args.out, "params.json"), "w") as f:
         json.dump({"size": SIZE, "overlap": OVERLAP, "trim": DNA_TRIM_START, "max_dwell": MAX_DWELL,
-                   "max_spb": MAX_SPB, "holdout": HOLDOUT, "files": len(stats), **tot}, f, indent=1)
+                   "max_spb": MAX_SPB, "holdout": HOLDOUT, "part": args.part, "files": len(stats), **tot}, f, indent=1)
     print(json.dumps(tot), f"total {time.time() - t:.0f} s", flush=True)
 
 
