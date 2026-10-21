@@ -272,9 +272,11 @@ public:
         const int64_t p = 256 / T_enc;                  // koi MatMulOp: M multiple of 256
         const int64_t n_blocks = pad_to(total_gran, p);
         const int64_t max_num_granularity = n_blocks;
+        // pinned + non_blocking: a pageable upload would block the host until the stream's earlier work is done
         auto chunk_table = torch::from_blob(table.data(), {n, 2}, torch::TensorOptions().dtype(torch::kInt32))
                                    .mul(granularity)
-                                   .to(i32);
+                                   .pin_memory()
+                                   .to(i32, /*non_blocking=*/true);
         auto conv_load_lut = torch::empty({total_gran}, i32);
         auto conv_store_lut = torch::empty({total_gran}, i32);
         auto qkv_rope_lut = torch::zeros({n_blocks}, i32);
