@@ -99,12 +99,16 @@ def build_pool(args, dev):
     print(f"{len(wins)} windows loaded, {time.time() - t:.0f} s", flush=True)
     eng = DecodeEngine(bf16_copy(model), args.batch, STEP_TOKENS, model.encoder.chunksize // model.encoder.stride)
     ident = np.empty(len(wins))
-    for i in range(0, len(wins), args.batch):
+    for k, i in enumerate(range(0, len(wins), args.batch)):
         g = wins[i:i + args.batch]
         sig = torch.from_numpy(np.stack([w[0] for w in g + [g[-1]] * (args.batch - len(g))])).to(dev)
         with torch.no_grad():
             calls, _ = decode(eng, model.encoder(sig[:, None]), model.tokenizer)
         ident[i:i + len(g)] = [masked_identity(c, s, w > 0) for c, (_, s, w) in zip(calls, g)]
+        if (k + 1) % 20 == 0:
+            done = ident[:i + len(g)]
+            print(f"decoded {i + len(g)} / {len(wins)}, {time.time() - t:.0f} s: identity mean {done.mean():.4f}, "
+                  f"< {args.hard_ident}: {(done < args.hard_ident).mean():.4f}", flush=True)
     hp = np.array([max_homopolymer(w[1]) for w in wins])
     hard = (ident < args.hard_ident) | (hp >= args.hard_hp)
     easy = np.nonzero(~hard)[0]

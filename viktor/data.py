@@ -173,15 +173,17 @@ class WindowDataset(torch.utils.data.IterableDataset):
                 idx = split_rows(pl.read_parquet(path), self.split)
                 if idx.height == 0:
                     continue
-                groups = [g.to_dicts() for g in idx.partition_by("read_id")]
+                # rows stay columnar; only the reads being loaded become dicts (a whole file of dicts took GBs per worker)
+                groups = (idx.with_row_index("_i").group_by("read_id", maintain_order=True)
+                          .agg("_i")["_i"].to_list())  # row indices per read, in first-appearance order
                 rng.shuffle(groups)
                 flat = segs = None
                 flat, segs = load_segments(os.path.join(self.stage6, os.path.basename(path)), idx["read_id"].unique(),
                                            self.segments)
                 pa.default_memory_pool().release_unused()  # return the previous file's and the read buffers
-                with pod5.Reader(groups[0][0]["pod5"]) as reader:
+                with pod5.Reader(idx["pod5"][0]) as reader:
                     for i in range(0, len(groups), self.reads_per_load):
-                        rows = [r for g in groups[i:i + self.reads_per_load] for r in g]
+                        rows = idx[[j for g in groups[i:i + self.reads_per_load] for j in g]].to_dicts()
                         for r, x in zip(rows, read_signals(reader, rows, self.mean, self.stdev)):
                             seq = label(fa, r)
                             try:
