@@ -5,8 +5,9 @@ the child read, then the window x[win : win + 12288]); the label is fetched from
 WindowDataset streams one split: each (rank, worker) owns a disjoint share of the index files (one per pod5
 file), loads a few reads at a time (all their windows) and yields from a shuffle buffer.
 Training windows also carry each label base's prefix frame (window-local encoder frame of its signal midpoint),
-from the same stage-6 forced alignment make_windows.py used (stage-6 file of the same name), for the attention
-alignment loss.
+from the same stage-6 forced alignment make_windows.py used, for the attention alignment loss: index rows carry
+their segment (seg_off ...) and its dwell is memory-mapped from INDEX_DIR/dwell/<file>.npy; older indexes without it
+read the stage-6 file of the same name (load_segments, several GB per worker while loading).
 Training and validation use only windows of full-quality reads (read weight w == 1); the chr20 'heldout'
 test set keeps every read, so it stays the same for every model compared on it.
 PARTS lists the BasecallerData sources (HG002 part 1, HG002 part 2, the Sowpati bacteria); MixedDataset draws
@@ -78,7 +79,8 @@ def read_signals(reader, rows, mean, stdev):
     for r in rows:
         raw, offset, scale, pore, flow_cell = recs[r["parent_id"]]
         child = raw[r["split_start"]: r["split_start"] + r["num_samples"]]
-        out.append(dorado_scale(child, offset, scale, mean, stdev, pore, flow_cell)[r["win"]: r["win"] + SIZE])
+        # copy: a view would keep the whole scaled read alive (the shuffle buffer holds thousands of windows)
+        out.append(dorado_scale(child, offset, scale, mean, stdev, pore, flow_cell)[r["win"]: r["win"] + SIZE].copy())
     return out
 
 
@@ -115,22 +117,30 @@ def load_segments(stage6_file, read_ids, segments=SEGMENTS):
     return flat, segs
 
 
-def base_centers(r, flat, segs):
+def _centers(r, flat, off, n, f0, fx):
+    A = r["win"] + DNA_TRIM_START  # window start in child-read samples
+    e = np.empty(n + 1, np.int64)
+    e[0], e[n] = f0, fx + 1
+    e[1:n] = f0 + np.cumsum(flat[off:off + n - 1], dtype=np.int64)
+    mid = CRF_FRAME // 2 * (e[:-1] + e[1:])
+    lo, hi = np.searchsorted(mid, A), np.searchsorted(mid, A + SIZE)
+    assert hi - lo == r["n_bases"], (r["read_id"], r["win"])
+    return ((mid[lo:hi] - A - STRIDE / 2) / STRIDE).astype(np.float32)
+
+
+def base_centers(r, flat, segs=None):
     """Window-local encoder frame of each label base's signal midpoint (read order), as make_windows.window_rows
     derives the label: base i enters at CRF frame e_i = f_first + cumsum(dwell), midpoint 3 * (e_i + e_{i+1}).
-    The segment is the one holding the window in both signal and reference (segments of fold-back reads overlap
-    in signal)."""
-    A = r["win"] + DNA_TRIM_START  # window start in child-read samples
+    segs None: the row names its segment (flat = the index's dwell/<file>.npy). Otherwise (load_segments) the
+    segment is the one holding the window in both signal and reference (segments of fold-back reads overlap in
+    signal)."""
+    if segs is None:
+        return _centers(r, flat, r["seg_off"], r["seg_n"], r["f_first"], r["f_exit"])
+    A = r["win"] + DNA_TRIM_START
     for off, n, f0, fx, contig, strand, t0, t1 in segs[r["read_id"]]:
         if (CRF_FRAME * f0 <= A and A + SIZE <= CRF_FRAME * (fx + 1) and contig == r["contig"]
                 and strand == r["strand"] and t0 <= r["g_lo"] and r["g_hi"] <= t1):
-            e = np.empty(n + 1, np.int64)
-            e[0], e[n] = f0, fx + 1
-            e[1:n] = f0 + np.cumsum(flat[off:off + n - 1], dtype=np.int64)
-            mid = CRF_FRAME // 2 * (e[:-1] + e[1:])
-            lo, hi = np.searchsorted(mid, A), np.searchsorted(mid, A + SIZE)
-            assert hi - lo == r["n_bases"], (r["read_id"], r["win"])
-            return ((mid[lo:hi] - A - STRIDE / 2) / STRIDE).astype(np.float32)
+            return _centers(r, flat, off, n, f0, fx)
     raise KeyError(f"no stage-6 segment holds window {r['read_id']} {r['win']}")
 
 
@@ -178,9 +188,13 @@ class WindowDataset(torch.utils.data.IterableDataset):
                           .agg("_i")["_i"].to_list())  # row indices per read, in first-appearance order
                 rng.shuffle(groups)
                 flat = segs = None
-                flat, segs = load_segments(os.path.join(self.stage6, os.path.basename(path)), idx["read_id"].unique(),
-                                           self.segments)
-                pa.default_memory_pool().release_unused()  # return the previous file's and the read buffers
+                cache = os.path.join(os.path.dirname(path), "dwell", os.path.basename(path)[:-len(".parquet")] + ".npy")
+                if os.path.exists(cache):
+                    flat = np.load(cache, mmap_mode="r")
+                else:
+                    flat, segs = load_segments(os.path.join(self.stage6, os.path.basename(path)),
+                                               idx["read_id"].unique(), self.segments)
+                    pa.default_memory_pool().release_unused()  # return the previous file's and the read buffers
                 with pod5.Reader(idx["pod5"][0]) as reader:
                     for i in range(0, len(groups), self.reads_per_load):
                         rows = idx[[j for g in groups[i:i + self.reads_per_load] for j in g]].to_dicts()

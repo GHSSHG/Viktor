@@ -16,6 +16,9 @@ One parquet per pod5 file, one row per window:
   win                                             window start in the trimmed child signal (x[win : win+12288])
   contig strand g_lo g_hi n_bases                 label = ref[g_lo:g_hi], reverse-complemented if strand '-'
   mask_lo mask_hi w split
+  seg_off seg_n f_first f_exit                    the window's stage-6 segment: its dwell is OUT/dwell/<pod5 file>.npy
+                                                  [seg_off : seg_off + seg_n - 1] (only segments with windows are kept;
+                                                  the training loader memory-maps it instead of reading stage 6)
 
 Examples:
   python -m scripts.make_windows build --out ~/Work/BasecallerData/viktor_win12288 --workers 16   # CPU only
@@ -136,21 +139,32 @@ def process(job):
     for c, s, e in patch.iter_rows():
         patch_by_contig.setdefault(c, []).append((s, e))
     cols = {k: [] for k in ("read_id", "parent_id", "pod5", "split_start", "num_samples", "win", "contig", "strand",
-                            "g_lo", "g_hi", "n_bases", "mask_lo", "mask_hi", "w", "split")}
+                            "g_lo", "g_hi", "n_bases", "mask_lo", "mask_hi", "w", "split",
+                            "seg_off", "seg_n", "f_first", "f_exit")}
     skip = {"outside": 0, "stall": 0, "few_bases": 0}
+    kept, seg_off = [], 0  # dwell of the segments that have windows
     for i, r in enumerate(s6.drop("dwell").iter_rows(named=True)):
         rows, sk = window_rows(r, flat[offs[i]:offs[i + 1]], by_seg.get((r["read_id"], r["seg"]), ()), patch_by_contig)
         for k in skip:
             skip[k] += sk[k]
+        if rows:
+            kept.append(flat[offs[i]:offs[i + 1]])
         split = "heldout" if r["contig"].startswith(HOLDOUT) else r["split"]
         for a, g_lo, g_hi, nb, mlo, mhi in rows:
             for k, v in (("read_id", r["read_id"]), ("parent_id", r["parent_id"]), ("pod5", pod5_paths[r["pod5_file"]]),
                          ("split_start", r["split_start"]), ("num_samples", r["num_samples"]), ("win", a),
                          ("contig", r["contig"]), ("strand", r["strand"]), ("g_lo", g_lo), ("g_hi", g_hi),
-                         ("n_bases", nb), ("mask_lo", mlo), ("mask_hi", mhi), ("w", r["w_channel"]), ("split", split)):
+                         ("n_bases", nb), ("mask_lo", mlo), ("mask_hi", mhi), ("w", r["w_channel"]), ("split", split),
+                         ("seg_off", seg_off), ("seg_n", r["n"]), ("f_first", r["f_first"]), ("f_exit", r["f_exit"])):
                 cols[k].append(v)
+        if rows:
+            seg_off += len(kept[-1])
     df = pl.DataFrame(cols, schema_overrides={"win": pl.Int32, "n_bases": pl.Int32, "w": pl.Float32,
-                                              "mask_lo": pl.List(pl.Int32), "mask_hi": pl.List(pl.Int32)})
+                                              "mask_lo": pl.List(pl.Int32), "mask_hi": pl.List(pl.Int32),
+                                              "seg_off": pl.Int64, "seg_n": pl.Int32, "f_first": pl.Int32,
+                                              "f_exit": pl.Int32})
+    os.makedirs(os.path.join(out, "dwell"), exist_ok=True)
+    np.save(os.path.join(out, "dwell", name + ".npy"), np.concatenate(kept or [flat[:0]]))
     df.write_parquet(os.path.join(out, name + ".parquet"))
     return {"file": name, "segments": s6.height, "windows": df.height, "bases": int(df["n_bases"].sum() or 0),
             **skip, "seconds": round(time.time() - t, 1)}

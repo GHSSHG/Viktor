@@ -1,8 +1,8 @@
 """GSPO (group sequence policy optimisation) on top of an SFT checkpoint, one GPU.
 
 pool   greedy-decode --pool-scan random 'train' windows (w == 1) of the index with the SFT model and keep a window pool:
-       every hard window (identity < --hard-ident, or a label homopolymer >= --hard-hp) plus random others
-       (--easy-frac of the pool); signals, labels and base weights are stored in OUT/pool.pt.
+       every hard window (identity < --hard-ident; a homopolymer the model cannot stop on already scores low) plus
+       random others (--easy-frac of the pool); signals, labels and base weights are stored in OUT/pool.pt.
 train  every step: --windows-per-step pool windows (hard with probability 1 - --easy-frac), --group samples each
        (DecodeEngine, temperature --temperature) -> reward = masked identity to the reference label (errors on
        weight-0 bases are not counted; a call that never ends is scored as it stands). Advantage = reward
@@ -110,7 +110,7 @@ def build_pool(args, dev):
             print(f"decoded {i + len(g)} / {len(wins)}, {time.time() - t:.0f} s: identity mean {done.mean():.4f}, "
                   f"< {args.hard_ident}: {(done < args.hard_ident).mean():.4f}", flush=True)
     hp = np.array([max_homopolymer(w[1]) for w in wins])
-    hard = (ident < args.hard_ident) | (hp >= args.hard_hp)
+    hard = ident < args.hard_ident
     easy = np.nonzero(~hard)[0]
     n_easy = min(len(easy), int(hard.sum() * args.easy_frac / (1 - args.easy_frac)))
     keep = np.concatenate([np.nonzero(hard)[0], rng.choice(easy, n_easy, replace=False)])
@@ -118,8 +118,8 @@ def build_pool(args, dev):
                 "w": [wins[i][2] for i in keep], "ident": ident[keep], "hp": hp[keep], "hard": hard[keep]},
                os.path.join(args.out, "pool.pt"))
     print(f"scanned {len(wins)}: identity mean {ident.mean():.4f}, derail {(ident < 0.9).mean():.4f}, "
-          f"hard {int(hard.sum())} (identity < {args.hard_ident}: {int((ident < args.hard_ident).sum())}, "
-          f"homopolymer >= {args.hard_hp}: {int((hp >= args.hard_hp).sum())}), pool {len(keep)}, {time.time() - t:.0f} s",
+          f"hard (identity < {args.hard_ident}) {int(hard.sum())}, homopolymer >= {args.hard_hp}: "
+          f"{int((hp >= args.hard_hp).sum())}, pool {len(keep)}, {time.time() - t:.0f} s",
           flush=True)
 
 
@@ -274,7 +274,7 @@ def main():
     ap.add_argument("--pool-scan", type=int, default=200_000, help="pool: train windows decoded")
     ap.add_argument("--batch", type=int, default=512, help="pool: decode batch")
     ap.add_argument("--hard-ident", type=float, default=0.99)
-    ap.add_argument("--hard-hp", type=int, default=8)
+    ap.add_argument("--hard-hp", type=int, default=8, help="homopolymer length of the heldout_hp evaluation subset")
     ap.add_argument("--easy-frac", type=float, default=0.3, help="share of easy windows in the pool and in each step")
     ap.add_argument("--steps", type=int, default=1000)
     ap.add_argument("--windows-per-step", type=int, default=64)
