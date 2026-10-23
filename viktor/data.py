@@ -62,6 +62,12 @@ def index_files(index_dir):
     return sorted(glob.glob(os.path.join(index_dir, "*.pod5.parquet")))
 
 
+def pod5_path(path):
+    """The index's pod5 path, or its copy under /data_nvme when /data is unavailable (HG002 part 2 is mirrored there)."""
+    alt = path.replace("/data/", "/data_nvme/", 1)
+    return alt if path.startswith("/data/") and not os.path.exists(path) and os.path.exists(alt) else path
+
+
 def split_rows(index, split):
     """Index rows (DataFrame or LazyFrame) of one split; low-quality reads (w < 1) are excluded except from
     the shared 'heldout' test set."""
@@ -152,7 +158,7 @@ def load_windows(rows, mean, stdev, ref=REF):
     for i, r in enumerate(rows):
         by_file.setdefault(r["pod5"], []).append(i)
     for path, ids in by_file.items():
-        with pod5.Reader(path) as reader:
+        with pod5.Reader(pod5_path(path)) as reader:
             for i, x in zip(ids, read_signals(reader, [rows[i] for i in ids], mean, stdev)):
                 seq = label(fa, rows[i])
                 out[i] = (x, seq, base_weights(rows[i], seq))
@@ -195,7 +201,7 @@ class WindowDataset(torch.utils.data.IterableDataset):
                     flat, segs = load_segments(os.path.join(self.stage6, os.path.basename(path)),
                                                idx["read_id"].unique(), self.segments)
                     pa.default_memory_pool().release_unused()  # return the previous file's and the read buffers
-                with pod5.Reader(idx["pod5"][0]) as reader:
+                with pod5.Reader(pod5_path(idx["pod5"][0])) as reader:
                     for i in range(0, len(groups), self.reads_per_load):
                         rows = idx[[j for g in groups[i:i + self.reads_per_load] for j in g]].to_dicts()
                         for r, x in zip(rows, read_signals(reader, rows, self.mean, self.stdev)):
