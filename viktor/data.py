@@ -10,7 +10,7 @@ their segment (seg_off ...) and its dwell is memory-mapped from INDEX_DIR/dwell/
 read the stage-6 file of the same name (load_segments, several GB per worker while loading).
 Training and validation use only windows of full-quality reads (read weight w == 1); the chr20 'heldout'
 test set keeps every read, so it stays the same for every model compared on it.
-PARTS lists the BasecallerData sources (HG002 part 1, HG002 part 2, the Sowpati bacteria); MixedDataset draws
+PARTS lists the BasecallerData sources (HG002 parts 1-3, the Sowpati bacteria, the Hall et al. 2024 bacteria); MixedDataset draws
 from several of them with fixed probabilities.
 """
 
@@ -44,6 +44,8 @@ PARTS = {
                   pod5="/data/hg002_giab2025.01_rest/pod5/*/*.pod5", chimera="part3_chimera_bp"),
     "bact": dict(prefix="bact_", stage6="stage6_bact", ref="reference/bacteria_sft3.fa",
                  pod5="/data_intel/sowpati_basemod/Raw/pod5/bacteria/*/*.pod5", chimera="bact_chimera_bp"),
+    "hall": dict(prefix="hall_", stage6="stage6_hall", ref="reference/bacteria_hall.fa",
+                 pod5="/data_intel/bacteria_hall2024/pod5/*/*.pod5", chimera="hall_chimera_bp"),
 }
 
 

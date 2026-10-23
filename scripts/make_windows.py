@@ -1,4 +1,4 @@
-"""Training windows from BasecallerData (--part: HG002 part 1 / part 2 / part 3, Sowpati bacteria; tables, stage-6 dir and
+"""Training windows from BasecallerData (--part: HG002 part 1 / part 2 / part 3, Sowpati or Hall et al. bacteria; tables, stage-6 dir and
 pod5 files from viktor.data.PARTS): Dorado-style 12288-sample chunks with reference labels.
 
 Labels come from the stage-6 CRF forced alignment of the T2T HG002 Q100 v1.2 reference to each read
