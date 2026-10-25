@@ -1,11 +1,20 @@
 """GSPO (group sequence policy optimisation) on top of an SFT checkpoint, data-parallel over torchrun ranks.
 
-pool   greedy-decode --pool-scan random 'train' windows (w == 1) of the --windows sources (DIR[:PART[:WEIGHT]] as
-       train.py; the scan is shared by weight) with the SFT model and keep a window pool: every hard window
-       (identity < --hard-ident; a homopolymer the model cannot stop on already scores low) plus random others
-       (--easy-frac of the pool); signals, labels, base weights and source part are stored in OUT/pool.pt. Each rank
-       scans a share of the index files; rank 0 merges the shares.
-train  every step: --windows-per-step pool windows (hard with probability 1 - --easy-frac), --group samples each
+scan   greedy-decode 'train' windows (w == 1) of the --windows sources (DIR[:PART[:WEIGHT]] as train.py) with the
+       SFT model until --pool-scan windows are scanned in all (shared by weight, then evenly over each source's index
+       files). Each index file's train rows are taken in a fixed shuffled order, so a larger --pool-scan later only
+       decodes the rows after those already in the scan table (OUT/scan/*.parquet: part, file, row, masked identity,
+       longest label homopolymer, label length, call, ended; one table per --init, checked by OUT/scan/init.txt).
+dorado Dorado SUP (CRF head, beam search) on the scanned windows with identity < --hard-ident that the cache
+       (--dorado-cache, shared by all runs: Dorado and the labels do not change) does not have yet. Per window:
+       Dorado's masked identity, the call-to-call identity, and 'shared' = the share of the model's errors (scored
+       reference positions) that Dorado also makes within +-2 bases. A window both get wrong in the same places is
+       more likely a label problem (the two share the Dorado encoder, so agreement is evidence, not proof).
+pool   (one process) classes from the scan table: derail (identity < --derail-ident), hard (< --hard-ident), easy;
+       drops label suspects (model and Dorado identity < --suspect-ident and shared >= --suspect-shared), keeps up
+       to --pool-max windows of each class (random) and stores signals, labels, base weights, class and source part
+       in OUT/pool.pt.
+train  every step: --windows-per-step pool windows drawn by class shares --mix (derail,hard,easy), --group samples each
        (DecodeEngine, temperature --temperature) -> reward = masked identity to the reference label (errors on
        weight-0 bases are not counted; a call that never ends is scored as it stands). Advantage = reward
        standardised within the group; groups whose samples all score the same carry no signal and are dropped.
@@ -20,33 +29,41 @@ train  every step: --windows-per-step pool windows (hard with probability 1 - --
        derail, and the same over the windows whose label has a homopolymer >= --hard-hp. Temperature guard (all
        ranks) and checkpoints as train.py (OUT/last.pt resumes).
 
-Examples (BD = ~/Work/BasecallerData):
-  torchrun --nproc-per-node 4 -m scripts.gspo pool --model-dir MODEL --init runs/sft3/snap_1020000.pt --out runs/gspo2 \
-      --windows $BD/viktor_win12288_part2:part2:0.85 $BD/viktor_win12288_bact:bact:0.15
-  torchrun --nproc-per-node 4 -m scripts.gspo train --model-dir MODEL --init runs/sft3/snap_1020000.pt --out runs/gspo2 \
-      --eval $BD/viktor_win12288_part2:part2:heldout $BD/viktor_win12288_bact:bact:val
+Examples (defaults: --windows part1 / part2 / bact / hall at 0.539 / 0.161 / 0.0795 / 0.2205, --eval part2 heldout,
+bact val, hall val):
+  torchrun --nproc-per-node 3 -m scripts.gspo scan --model-dir MODEL --init runs/sft4/snap_1540000.pt --out runs/gspo3 \
+      --pool-scan 1000000
+  torchrun --nproc-per-node 3 -m scripts.gspo dorado --model-dir MODEL --init runs/sft4/snap_1540000.pt --out runs/gspo3
+  torchrun --nproc-per-node 1 -m scripts.gspo pool --model-dir MODEL --init runs/sft4/snap_1540000.pt --out runs/gspo3
+  torchrun --nproc-per-node 3 -m scripts.gspo train --model-dir MODEL --init runs/sft4/snap_1540000.pt --out runs/gspo3
 """
 
 import argparse
 import copy
 import datetime
+import glob
 import os
 import re
 import time
+import zlib
 from multiprocessing import get_context
 
+import edlib
 import numpy as np
 import polars as pl
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from scripts.train import fixed_windows, identity_stats, masked_identity, parse_source, temperature_guard
+from scripts.train import (dorado_calls, fixed_windows, identity_stats, masked_identity, parse_source, ref_errors,
+                           temperature_guard)
 from viktor import Basecaller, DecodeEngine, get_tokenizer, load_dorado_encoder
 from viktor.data import index_files, load_windows, part_paths, split_rows
 from viktor.tokenizer import EOS, PAD
 
 STEP_TOKENS = 2048  # rollout length cap (labels are at most ~1,600 bases)
+CLASSES = ("derail", "hard", "easy")
+KEY = ["part", "file", "row"]  # a window: index file (basename) and row number in it
 
 
 def max_homopolymer(s):
@@ -88,71 +105,179 @@ def decode(engine, frames, tokenizer):
     return [tokenizer.decode(t) for t in toks], (toks == EOS).any(1).tolist()
 
 
-def _load_file(args):
-    rows, mean, stdev, part = args
-    return [w + (part,) for w in load_windows(rows, mean, stdev, part_paths(part)[0])]
+def _load_rows(job):
+    """(part, file, index rows, mean, stdev) -> the same plus their (signal, label, weights) windows."""
+    part, file, rows, mean, stdev = job
+    return part, file, rows, load_windows(rows, mean, stdev, part_paths(part)[0])
 
 
-def build_pool(args, dev, rank, world):
+def stream(jobs, procs, ahead=32):
+    """_load_rows results in job order, at most `ahead` jobs loaded ahead of the consumer."""
+    with get_context("spawn").Pool(procs) as pool:
+        for i in range(0, len(jobs), ahead):
+            yield from pool.imap(_load_rows, jobs[i:i + ahead])
+
+
+def read_table(d):
+    files = sorted(glob.glob(os.path.join(d, "*.parquet")))
+    return pl.read_parquet(files) if files else None
+
+
+def write_table(d, rank, rec):
+    if rec[KEY[0]]:
+        pl.DataFrame(rec).write_parquet(os.path.join(d, f"r{rank}_{time.time_ns()}.parquet"))
+        for v in rec.values():
+            v.clear()
+
+
+def index_rows(index_dir, file, rows=None):
+    """One index file's train rows (with their row number) in the file's fixed scan order, or the given rows."""
+    idx = pl.read_parquet(os.path.join(index_dir, file)).with_row_index("row").with_columns(pl.col("row").cast(pl.Int64))
+    if rows is not None:
+        return idx.filter(pl.col("row").is_in(rows))
+    return split_rows(idx, "train").sample(fraction=1.0, shuffle=True, seed=zlib.crc32(file.encode()))
+
+
+def chunks(part, file, idx, mean, stdev, size=1000):
+    rows = idx.to_dicts()
+    return [(part, file, rows[i:i + size], mean, stdev) for i in range(0, len(rows), size)]
+
+
+def scan(args, dev, rank, world):
+    out = os.path.join(args.out, "scan")
+    os.makedirs(out, exist_ok=True)
+    tag = os.path.join(out, "init.txt")
+    if rank == 0 and not os.path.exists(tag):
+        with open(tag, "w") as f:
+            f.write(os.path.abspath(args.init))
+    dist.barrier()
+    with open(tag) as f:
+        assert f.read() == os.path.abspath(args.init), f"{out} holds a scan of another --init"
     model = load_model(args.model_dir, args.init, dev)
-    rng = np.random.default_rng(args.seed + rank)
+    done = read_table(out)
+    have = {} if done is None else {(p, f): n for p, f, n in done.group_by("part", "file").len().iter_rows()}
     sources = [parse_source(s) for s in args.windows]
     total_w = sum(w for _, _, w in sources)
     jobs = []
     for d, part, w in sources:
-        files = index_files(d)
+        files = [os.path.basename(f) for f in index_files(d)]
         per = -(-int(args.pool_scan * w / total_w) // len(files))
-        for i, f in enumerate(files):
-            idx = split_rows(pl.read_parquet(f), "train")
-            jobs.append((idx.sample(min(per, idx.height), seed=args.seed + i).to_dicts(), model.encoder.mean,
-                         model.encoder.stdev, part))
+        for f in files:
+            if have.get((part, f), 0) < per:
+                jobs += chunks(part, f, index_rows(d, f)[have.get((part, f), 0):per], model.encoder.mean, model.encoder.stdev)
     jobs = jobs[rank::world]
-    t = time.time()
-    with get_context("spawn").Pool(max(1, 16 // world)) as pool:
-        wins = [w for ws in pool.imap_unordered(_load_file, jobs) for w in ws]
-    print(f"rank {rank}: {len(wins)} windows loaded, {time.time() - t:.0f} s", flush=True)
+    n_todo = sum(len(j[2]) for j in jobs)
     eng = DecodeEngine(bf16_copy(model), args.batch, STEP_TOKENS, model.encoder.chunksize // model.encoder.stride)
-    ident = np.empty(len(wins))
-    for k, i in enumerate(range(0, len(wins), args.batch)):
-        g = wins[i:i + args.batch]
-        sig = torch.from_numpy(np.stack([w[0] for w in g + [g[-1]] * (args.batch - len(g))])).to(dev)
+    rec = {k: [] for k in KEY + ["ident", "hp", "n_bases", "call", "ended"]}
+    buf, n, t = [], 0, time.time()
+
+    def flush(g):
+        sig = torch.from_numpy(np.stack([x[3][0] for x in g + [g[-1]] * (args.batch - len(g))])).to(dev)
         with torch.no_grad():
-            calls, _ = decode(eng, model.encoder(sig[:, None]), model.tokenizer)
-        ident[i:i + len(g)] = [masked_identity(c, s, w > 0) for c, (_, s, w, _) in zip(calls, g)]
-        if rank == 0 and (k + 1) % 20 == 0:
-            done = ident[:i + len(g)]
-            print(f"rank 0: decoded {i + len(g)} / {len(wins)}, {time.time() - t:.0f} s: identity mean {done.mean():.4f}, "
-                  f"< {args.hard_ident}: {(done < args.hard_ident).mean():.4f}", flush=True)
-    hp = np.array([max_homopolymer(w[1]) for w in wins])
-    src = np.array([w[3] for w in wins])
-    hard = ident < args.hard_ident
-    easy = np.nonzero(~hard)[0]
-    n_easy = min(len(easy), int(hard.sum() * args.easy_frac / (1 - args.easy_frac)))
-    keep = np.concatenate([np.nonzero(hard)[0], rng.choice(easy, n_easy, replace=False)])
-    share = os.path.join(args.out, f"pool_rank{rank}.pt")
-    torch.save({"sig": torch.from_numpy(np.stack([wins[i][0] for i in keep])), "seq": [wins[i][1] for i in keep],
-                "w": [wins[i][2] for i in keep], "ident": ident[keep], "hp": hp[keep], "hard": hard[keep],
-                "src": src[keep].tolist()}, share)
-    for part in sorted(set(src)):
-        m = src == part
-        print(f"rank {rank} {part}: scanned {int(m.sum())}: identity mean {ident[m].mean():.4f}, derail "
-              f"{(ident[m] < 0.9).mean():.4f}, hard (identity < {args.hard_ident}) {int(hard[m].sum())}, "
-              f"homopolymer >= {args.hard_hp}: {int((hp[m] >= args.hard_hp).sum())}, {time.time() - t:.0f} s", flush=True)
-    del wins
+            calls, ended = decode(eng, model.encoder(sig[:, None]), model.tokenizer)
+        for (part, file, row, (_, seq, w)), c, e in zip(g, calls, ended):
+            for k, v in zip(rec, (part, file, row, masked_identity(c, seq, w > 0), max_homopolymer(seq), len(seq), c, e)):
+                rec[k].append(v)
+
+    for part, file, rows, wins in stream(jobs, max(1, 16 // world)):
+        buf += [(part, file, r["row"], x) for r, x in zip(rows, wins)]
+        while len(buf) >= args.batch or (buf and n + len(buf) == n_todo):
+            g, buf = buf[:args.batch], buf[args.batch:]
+            flush(g)
+            n += len(g)
+            if len(rec["row"]) >= 50_000:
+                write_table(out, rank, rec)
+            if rank == 0 and n // args.batch % 20 == 0:
+                print(f"rank 0: scanned {n} / {n_todo}, {time.time() - t:.0f} s", flush=True)
+    write_table(out, rank, rec)
     dist.barrier()
     if rank == 0:
-        shares = [torch.load(os.path.join(args.out, f"pool_rank{r}.pt"), weights_only=False) for r in range(world)]
-        pool = {k: (torch.cat([s[k] for s in shares]) if k == "sig" else
-                    np.concatenate([s[k] for s in shares]) if isinstance(shares[0][k], np.ndarray) else
-                    [x for s in shares for x in s[k]]) for k in shares[0]}
-        torch.save(pool, os.path.join(args.out, "pool.pt"))
-        for r in range(world):
-            os.remove(os.path.join(args.out, f"pool_rank{r}.pt"))
-        n = {p: (sum(x == p for x in pool["src"]), int(sum(h for x, h in zip(pool["src"], pool["hard"]) if x == p)))
-             for p in sorted(set(pool["src"]))}
-        print(f"pool {len(pool['seq'])} (hard {int(pool['hard'].sum())}); per part (windows, hard): {n}, "
-              f"{time.time() - t:.0f} s", flush=True)
+        sc = read_table(out)
+        summary = sc.group_by("part").agg(pl.len().alias("windows"), pl.col("ident").mean().alias("identity_mean"),
+                                          (pl.col("ident") < args.derail_ident).mean().alias("derail"),
+                                          (pl.col("ident") < args.hard_ident).mean().alias("hard")).sort("part")
+        print(f"scan table: {sc.height} windows ({time.time() - t:.0f} s)\n{summary}", flush=True)
+
+
+def shared_errors(a, b, tol=2):
+    """Share of the positions a (sorted) with a position of b (sorted) within tol."""
+    if len(a) == 0 or len(b) == 0:
+        return 0.0
+    i = np.searchsorted(b, a)
+    lo, hi = b[np.clip(i - 1, 0, len(b) - 1)], b[np.clip(i, 0, len(b) - 1)]
+    return float(((np.abs(a - lo) <= tol) | (np.abs(a - hi) <= tol)).mean())
+
+
+def dorado_check(args, dev, rank, world):
+    sc = read_table(os.path.join(args.out, "scan")).filter(pl.col("ident") < args.hard_ident)
+    cache = read_table(args.dorado_cache)
+    if cache is not None:
+        sc = sc.join(cache.select(KEY), on=KEY, how="anti")
+    os.makedirs(args.dorado_cache, exist_ok=True)
+    dirs = {part: d for d, part, _ in (parse_source(s) for s in args.windows)}
+    encoder = load_dorado_encoder(args.model_dir).to(dev, torch.float16).eval().use_koi()
+    jobs = []
+    for (part, file), g in sc.sort(KEY).group_by(["part", "file"], maintain_order=True):
+        idx = index_rows(dirs[part], file, g["row"]).join(g.select("row", "call"), on="row", how="left")
+        jobs += chunks(part, file, idx, encoder.mean, encoder.stdev)
+    jobs = jobs[rank::world]
+    n_todo = sum(len(j[2]) for j in jobs)
+    rec = {k: [] for k in KEY + ["d_ident", "vd_ident", "shared", "v_err", "d_err"]}
+    n, t = 0, time.time()
+    for part, file, rows, wins in stream(jobs, max(1, 16 // world)):
+        for r, (_, seq, w), d in zip(rows, wins, dorado_calls(args.model_dir, encoder, wins, dev)):
+            scored = w > 0
+            ev, ed = ref_errors(r["call"], seq), ref_errors(d, seq)
+            ev, ed = ev[scored[ev]], ed[scored[ed]]
+            vd = edlib.align(r["call"], d, mode="NW", task="distance")["editDistance"]
+            for k, v in zip(rec, (part, file, r["row"], 1 - len(ed) / max(int(scored.sum()), 1), 1 - vd / max(len(d), 1),
+                                  shared_errors(np.unique(ev), np.unique(ed)), len(ev), len(ed))):
+                rec[k].append(v)
+        n += len(rows)
+        if len(rec["row"]) >= 50_000:
+            write_table(args.dorado_cache, rank, rec)
+        if rank == 0:
+            print(f"rank 0: Dorado {n} / {n_todo}, {time.time() - t:.0f} s", flush=True)
+    write_table(args.dorado_cache, rank, rec)
     dist.barrier()
+
+
+def build_pool(args):
+    t = time.time()
+    ident = pl.col("ident")
+    sc = read_table(os.path.join(args.out, "scan")).drop("call").with_columns(
+        cls=pl.when(ident < args.derail_ident).then(0).when(ident < args.hard_ident).then(1).otherwise(2))
+    cache = read_table(args.dorado_cache)
+    if cache is None:
+        sc = sc.with_columns(d_ident=pl.lit(None, pl.Float64), suspect=pl.lit(False))
+    else:
+        sc = sc.join(cache, on=KEY, how="left").with_columns(
+            suspect=((ident < args.suspect_ident) & (pl.col("d_ident") < args.suspect_ident)
+                     & (pl.col("shared") >= args.suspect_shared)).fill_null(False))
+    print(sc.group_by("part", "cls").agg(pl.len().alias("windows"), pl.col("suspect").sum().alias("suspect"),
+                                         (pl.col("d_ident").is_null() & (pl.col("cls") < 2)).sum().alias("no_dorado"))
+          .sort("part", "cls"), flush=True)
+    keep = sc.filter(~pl.col("suspect"))
+    pick = pl.concat([keep.filter(pl.col("cls") == c).sample(min(args.pool_max, int((keep["cls"] == c).sum())), seed=args.seed)
+                      for c in range(len(CLASSES))]).sort(KEY)
+    dirs = {part: d for d, part, _ in (parse_source(s) for s in args.windows)}
+    encoder = load_dorado_encoder(args.model_dir)
+    jobs = []
+    for (part, file), g in pick.group_by(["part", "file"], maintain_order=True):
+        idx = index_rows(dirs[part], file, g["row"]).join(g.select("row", "ident", "hp", "cls"), on="row", how="left")
+        jobs += chunks(part, file, idx, encoder.mean, encoder.stdev)
+    pool = {"sig": [], "seq": [], "w": [], "ident": [], "hp": [], "cls": [], "src": []}
+    for part, _, rows, wins in stream(jobs, 32):
+        for r, (x, seq, w) in zip(rows, wins):
+            for k, v in zip(pool, (x, seq, w, r["ident"], r["hp"], r["cls"], part)):
+                pool[k].append(v)
+    pool["sig"] = torch.from_numpy(np.stack(pool["sig"]))
+    for k in ("ident", "hp", "cls"):
+        pool[k] = np.array(pool[k])
+    torch.save(pool, os.path.join(args.out, "pool.pt"))
+    n = {p: [int(((np.array(pool["src"]) == p) & (pool["cls"] == c)).sum()) for c in range(len(CLASSES))]
+         for p in sorted(set(pool["src"]))}
+    print(f"pool {len(pool['seq'])}; per part {'/'.join(CLASSES)}: {n}, {time.time() - t:.0f} s", flush=True)
 
 
 def token_logprobs(model, frames, seqs, ended):
@@ -197,7 +322,10 @@ def train(args, dev, rank, world):
         opt.load_state_dict(s["opt"])
         step, run_id = s["step"], s.get("wandb_id")
     pool = torch.load(os.path.join(args.out, "pool.pt"), weights_only=False)
-    hard, easy = np.nonzero(pool["hard"])[0], np.nonzero(~pool["hard"])[0]
+    by_cls = [np.nonzero(pool["cls"] == c)[0] for c in range(len(CLASSES))]
+    mix = np.array([float(x) for x in args.mix.split(",")])
+    mix /= mix.sum()
+    assert all(len(ix) for ix, m in zip(by_cls, mix) if m > 0), [len(ix) for ix in by_cls]
     inf = bf16_copy(model)
     B, G = args.windows_per_step, args.group
     roll = DecodeEngine(inf, B * G, STEP_TOKENS, model.encoder.chunksize // model.encoder.stride, temperature=args.temperature)
@@ -213,7 +341,8 @@ def train(args, dev, rank, world):
         import wandb
         wb = wandb.init(project=args.wandb_project, name=os.path.basename(os.path.normpath(args.out)), id=run_id,
                         resume="allow", dir=args.out,
-                        config=vars(args) | {"pool": len(pool["seq"]), "pool_hard": len(hard), "world": world})
+                        config=vars(args) | {"pool": len(pool["seq"]), "world": world}
+                        | {f"pool_{c}": len(ix) for c, ix in zip(CLASSES, by_cls)})
     rng = np.random.default_rng(args.seed * 1000 + step + 7919 * rank)
 
     def evaluate():
@@ -241,8 +370,8 @@ def train(args, dev, rank, world):
     while step < args.steps:
         t0 = time.time()
         paused = temperature_guard(rank, dev, args.temp_pause, args.temp_resume)
-        n_hard = rng.binomial(B, 1 - args.easy_frac)
-        pick = np.concatenate([rng.choice(hard, n_hard), rng.choice(easy, B - n_hard)])
+        pick = np.concatenate([rng.choice(ix, k) for ix, k in zip(by_cls, rng.multinomial(B, mix)) if k])
+        cls = pool["cls"][pick]
         sig = pool["sig"][torch.from_numpy(pick)].to(dev)
         labels, weights = [pool["seq"][i] for i in pick], [pool["w"][i] for i in pick]
         with torch.no_grad():
@@ -295,13 +424,16 @@ def train(args, dev, rank, world):
         sync(inf, model)
         step += 1
         # step statistics summed over ranks
+        per_cls = [x for c in range(len(CLASSES)) for x in (reward[cls == c].sum(), reward[cls == c].size)]
         tot = torch.tensor([reward.sum(), reward.max(1).sum(), (reward < 0.9).sum(), reward.size, len(live), B,
-                            sum(ended), len(ended), stats["pg"], stats["ce"], stats["clip"], stats["ratio"], stats["n"]],
-                           device=dev, dtype=torch.float64)
+                            sum(ended), len(ended), stats["pg"], stats["ce"], stats["clip"], stats["ratio"], stats["n"]]
+                           + per_cls, device=dev, dtype=torch.float64)
         dist.all_reduce(tot)
-        r_sum, best, der, n_r, n_live, n_win, n_end, n_calls, pg, ce, clip, ratio, n = tot.tolist()
+        r_sum, best, der, n_r, n_live, n_win, n_end, n_calls, pg, ce, clip, ratio, n = tot.tolist()[:13]
+        per_cls = tot.tolist()[13:]
         n = max(n, 1)
-        rec = {"reward/mean": r_sum / n_r, "reward/best_of_group": best / n_win, "reward/derail": der / n_r,
+        rec = {f"reward_cls/{c}": per_cls[2 * i] / per_cls[2 * i + 1] for i, c in enumerate(CLASSES) if per_cls[2 * i + 1]}
+        rec |= {"reward/mean": r_sum / n_r, "reward/best_of_group": best / n_win, "reward/derail": der / n_r,
                "groups_live": n_live / n_win, "ended": n_end / n_calls, "pg": pg / n, "ce": ce / n_win,
                "clip_frac": clip / n, "ratio_dev": ratio / n, "grad_norm": float(gnorm), "lr": args.lr,
                "s_rollout": t_roll, "s_per_step": time.time() - t0 - paused, "paused_s": paused,
@@ -320,20 +452,28 @@ def train(args, dev, rank, world):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["pool", "train"])
+    ap.add_argument("cmd", choices=["scan", "dorado", "pool", "train"])
     ap.add_argument("--model-dir", required=True)
     ap.add_argument("--init", required=True, help="SFT checkpoint (snap_*.pt or last.pt)")
     bd = os.path.expanduser("~/Work/BasecallerData")
-    ap.add_argument("--windows", nargs="+", default=[f"{bd}/viktor_win12288_part2:part2:0.85", f"{bd}/viktor_win12288_bact:bact:0.15"],
-                    help="pool: window index sources DIR[:PART[:WEIGHT]]")
-    ap.add_argument("--eval", nargs="+", default=[f"{bd}/viktor_win12288_part2:part2:heldout", f"{bd}/viktor_win12288_bact:bact:val"],
+    # human 0.7 (part1 : part2 by train windows ~77 : 23) + bacteria 0.3 (Sowpati : Hall by train windows)
+    ap.add_argument("--windows", nargs="+", default=[f"{bd}/viktor_win12288:part1:0.539", f"{bd}/viktor_win12288_part2:part2:0.161",
+                                                     f"{bd}/viktor_win12288_bact:bact:0.0795", f"{bd}/viktor_win12288_hall:hall:0.2205"],
+                    help="scan / dorado / pool: window index sources DIR[:PART[:WEIGHT]]")
+    ap.add_argument("--eval", nargs="+", default=[f"{bd}/viktor_win12288_part2:part2:heldout", f"{bd}/viktor_win12288_bact:bact:val",
+                                                  f"{bd}/viktor_win12288_hall:hall:val"],
                     help="train: evaluation sources DIR:PART:SPLIT")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--pool-scan", type=int, default=200_000, help="pool: train windows decoded")
-    ap.add_argument("--batch", type=int, default=512, help="pool: decode batch")
+    ap.add_argument("--pool-scan", type=int, default=1_000_000, help="scan: train windows in the scan table")
+    ap.add_argument("--batch", type=int, default=512, help="scan: decode batch")
+    ap.add_argument("--dorado-cache", default="runs/dorado_windows", help="dorado / pool: Dorado check table (all runs)")
+    ap.add_argument("--derail-ident", type=float, default=0.9)
     ap.add_argument("--hard-ident", type=float, default=0.99)
+    ap.add_argument("--suspect-ident", type=float, default=0.97, help="pool: label suspect if model and Dorado are below")
+    ap.add_argument("--suspect-shared", type=float, default=0.8, help="pool: ... and Dorado shares this much of the errors")
+    ap.add_argument("--pool-max", type=int, default=100_000, help="pool: windows kept per class")
     ap.add_argument("--hard-hp", type=int, default=8, help="homopolymer length of the heldout_hp evaluation subset")
-    ap.add_argument("--easy-frac", type=float, default=0.3, help="share of easy windows in the pool and in each step")
+    ap.add_argument("--mix", default="0.15,0.55,0.30", help="train: shares of derail,hard,easy windows per step")
     ap.add_argument("--steps", type=int, default=1000)
     ap.add_argument("--windows-per-step", type=int, default=64)
     ap.add_argument("--group", type=int, default=8)
@@ -359,7 +499,11 @@ def main():
     torch.manual_seed(args.seed + rank)
     torch.backends.cuda.matmul.allow_tf32 = True
     os.makedirs(args.out, exist_ok=True)
-    (build_pool if args.cmd == "pool" else train)(args, dev, rank, world)
+    if args.cmd == "pool":
+        assert world == 1, "pool runs in one process"
+        build_pool(args)
+    else:
+        {"scan": scan, "dorado": dorado_check, "train": train}[args.cmd](args, dev, rank, world)
     dist.destroy_process_group()
 
 

@@ -106,12 +106,12 @@ def temperature_guard(rank, dev, pause, resume, wait=10):
         time.sleep(wait)
 
 
-def masked_identity(pred, ref, scored):
-    """Identity over scored reference bases (as SUPEncoder eval_free9): NW path; a mismatch or deletion counts
-    against its reference base, an insertion against the reference base before it."""
+def ref_errors(pred, ref):
+    """Reference positions of pred's errors (NW path; one entry per error): a mismatch or deletion at its reference
+    base, an insertion at the reference base before it."""
     # an empty call has no edlib path (cigar None): every reference base is deleted
     cig = edlib.align(pred, ref, mode="NW", task="path")["cigar"] or f"{len(ref)}D"
-    ri, err, num = 0, 0, ""
+    ri, pos, num = 0, [], ""
     for ch in cig:
         if ch.isdigit():
             num += ch
@@ -120,11 +120,16 @@ def masked_identity(pred, ref, scored):
         if ch == "=":
             ri += n
         elif ch in "XD":
-            err += int(scored[ri:ri + n].sum())
+            pos += range(ri, ri + n)
             ri += n
         elif ch == "I":
-            err += n * int(scored[max(ri - 1, 0)])
-    return 1 - err / max(int(scored.sum()), 1)
+            pos += [max(ri - 1, 0)] * n
+    return np.array(pos, dtype=np.int64)
+
+
+def masked_identity(pred, ref, scored):
+    """Identity over scored reference bases (as SUPEncoder eval_free9): errors on unscored bases do not count."""
+    return 1 - int(scored[ref_errors(pred, ref)].sum()) / max(int(scored.sum()), 1)
 
 
 def identity_stats(preds, wins):
