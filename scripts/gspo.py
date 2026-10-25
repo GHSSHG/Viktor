@@ -2,8 +2,8 @@
 
 scan   greedy-decode 'train' windows (w == 1) of the --windows sources (DIR[:PART[:WEIGHT]] as train.py) with the
        SFT model until --pool-scan windows are scanned in all (shared by weight, then evenly over each source's index
-       files). Each index file's train rows are taken in a fixed shuffled order, so a larger --pool-scan later only
-       decodes the rows after those already in the scan table (OUT/scan/*.parquet: part, file, row, masked identity,
+       files). Each index file's train rows are taken in a fixed shuffled order, so a larger --pool-scan later (or a rerun
+       after a crash) only decodes the rows not yet in the scan table (OUT/scan/*.parquet: part, file, row, masked identity,
        longest label homopolymer, label length, call, ended; one table per --init, checked by OUT/scan/init.txt).
 dorado Dorado SUP (CRF head, beam search) on the scanned windows with identity < --hard-ident that the cache
        (--dorado-cache, shared by all runs: Dorado and the labels do not change) does not have yet. Per window:
@@ -155,7 +155,7 @@ def scan(args, dev, rank, world):
         assert f.read() == os.path.abspath(args.init), f"{out} holds a scan of another --init"
     model = load_model(args.model_dir, args.init, dev)
     done = read_table(out)
-    have = {} if done is None else {(p, f): n for p, f, n in done.group_by("part", "file").len().iter_rows()}
+    have = {} if done is None else {(p, f): r for p, f, r in done.group_by("part", "file").agg("row").iter_rows()}
     sources = [parse_source(s) for s in args.windows]
     total_w = sum(w for _, _, w in sources)
     jobs = []
@@ -163,8 +163,9 @@ def scan(args, dev, rank, world):
         files = [os.path.basename(f) for f in index_files(d)]
         per = -(-int(args.pool_scan * w / total_w) // len(files))
         for f in files:
-            if have.get((part, f), 0) < per:
-                jobs += chunks(part, f, index_rows(d, f)[have.get((part, f), 0):per], model.encoder.mean, model.encoder.stdev)
+            if len(have.get((part, f), [])) < per:  # the first `per` rows of the scan order not yet in the table
+                todo = index_rows(d, f)[:per].filter(~pl.col("row").is_in(have.get((part, f), [])))
+                jobs += chunks(part, f, todo, model.encoder.mean, model.encoder.stdev)
     jobs = jobs[rank::world]
     n_todo = sum(len(j[2]) for j in jobs)
     eng = DecodeEngine(bf16_copy(model), args.batch, STEP_TOKENS, model.encoder.chunksize // model.encoder.stride)
