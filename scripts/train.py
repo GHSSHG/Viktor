@@ -223,6 +223,8 @@ def main():
     ap.add_argument("--align-heads", default="0,4", help="supervised query heads in each of those layers")
     ap.add_argument("--align-sigma", type=float, default=1.0, help="alignment target width, encoder frames")
     ap.add_argument("--no-compile", action="store_true")
+    ap.add_argument("--no-split-reductions", action="store_true",
+                    help="inductor without split reductions (their Triton kernels failed to compile at small batches)")
     ap.add_argument("--workers", type=int, default=8, help="data loader workers per GPU")
     ap.add_argument("--log-every", type=int, default=100)
     ap.add_argument("--val-every", type=int, default=1000)
@@ -234,6 +236,8 @@ def main():
     ap.add_argument("--wandb-project", default="viktor")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
+    if args.no_split_reductions:
+        torch._inductor.config.split_reductions = False
 
     dist.init_process_group("nccl")
     rank, world = dist.get_rank(), dist.get_world_size()
