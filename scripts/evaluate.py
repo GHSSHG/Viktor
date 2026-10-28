@@ -36,7 +36,7 @@ def main():
     print("dorado", json.dumps(res["dorado"]), flush=True)
     for path in args.snaps:
         s = torch.load(path, map_location="cpu", weights_only=False)
-        model = Basecaller(encoder, get_tokenizer("base"))
+        model = Basecaller(encoder, get_tokenizer(s["args"].get("tokenizer", "base")))
         model.projector.load_state_dict(s["projector"])
         model.decoder.load_state_dict(s["decoder"])
         model.projector.to(dev)

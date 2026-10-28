@@ -1,5 +1,5 @@
-"""Stage-1 SFT: frozen Dorado SUP encoder (koi forward, no gradients), single-base decoder + projector trained
-from scratch on make_windows.py windows, one epoch of the train split. DDP via torchrun; decoder in fp32 with
+"""Stage-1 SFT: frozen Dorado SUP encoder (koi forward, no gradients), decoder (--tokenizer: single base or 4-mer) +
+projector trained from scratch on make_windows.py windows, one epoch of the train split. DDP via torchrun; decoder in fp32 with
 bf16 autocast, compiled with torch.compile (label lengths padded to multiples of --pad-to).
 
 Loss: weighted token cross-entropy + --align-weight x attention alignment loss (model.AlignConfig: chosen heads'
@@ -61,8 +61,8 @@ class Trainable(nn.Module):
         self.projector, self.decoder = model.projector, model.decoder
         self._model = [model]
 
-    def forward(self, frames, tokens_in, targets, w, centers):
-        return self._model[0].weighted_loss(frames, tokens_in, targets, w, centers)
+    def forward(self, frames, tokens_in, targets, w, centers, plens):
+        return self._model[0].weighted_loss(frames, tokens_in, targets, w, centers, plens)
 
 
 def wsd(step, total, peak, warmup, decay_frac, decay_start=None):
@@ -170,9 +170,10 @@ def eval_val(model, val, batch, dev, prefix="val"):
     loss = correct = scored = 0.0
     for i in range(0, len(val), batch):
         g = val[i:i + batch]
-        sig, seqs, ws = collate(g)
+        sig, valid, seqs, ws = collate(g)
+        frames, plens = model.encode(sig.to(dev), valid)
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            l, _, _, c, s = model.frame_loss(model.encoder(sig.to(dev)), seqs, ws)
+            l, _, _, c, s = model.frame_loss(frames, seqs, ws, plens)
         loss, correct, scored = loss + float(l) * len(g), correct + float(c), scored + float(s)
     model.train()
     return {f"{prefix}/loss": loss / len(val), f"{prefix}/acc": correct / scored}
@@ -190,8 +191,10 @@ def eval_heldout(model, heldout, batch, dev):
     for i in range(0, len(heldout), batch):
         g = heldout[i:i + batch]
         g = g + [g[-1]] * (batch - len(g))
-        frames = model.encoder(collate(g)[0].to(dev))
-        toks = eng.generate(frames.reshape(-1, frames.shape[-1]), [frames.shape[1]] * batch).cpu()
+        sig, valid = collate(g)[:2]
+        frames, plens = model.encode(sig.to(dev), valid)
+        plens = plens.tolist()
+        toks = eng.generate(torch.cat([f[:n] for f, n in zip(frames, plens)]), plens).cpu()
         preds += [model.tokenizer.decode(t) for t in toks]
     del eng, inf
     torch.cuda.empty_cache()
@@ -214,6 +217,7 @@ def main():
     ap.add_argument("--weight-decay", type=float, default=0.1)
     ap.add_argument("--clip", type=float, default=1.0)
     ap.add_argument("--pad-to", type=int, default=128, help="pad label lengths to a multiple (compile shapes)")
+    ap.add_argument("--tokenizer", choices=["base", "4mer"], default="base", help="decoder output unit")
     ap.add_argument("--align-weight", type=float, default=0.1, help="attention alignment loss weight (0 = off)")
     ap.add_argument("--align-layers", default="2,4", help="decoder layers with supervised heads")
     ap.add_argument("--align-heads", default="0,4", help="supervised query heads in each of those layers")
@@ -253,7 +257,7 @@ def main():
     stop = min(total, args.max_steps or total)
 
     encoder = load_dorado_encoder(args.model_dir).to(dev, torch.float16).eval().use_koi()
-    model = Basecaller(encoder, get_tokenizer("base"))
+    model = Basecaller(encoder, get_tokenizer(args.tokenizer))
     model.set_encoder_trainable(False)
     if args.align_weight > 0:
         model.align = AlignConfig(tuple(int(x) for x in args.align_layers.split(",")),
@@ -315,7 +319,7 @@ def main():
                    os.path.join(args.out, f"snap_{step:07d}.pt"))
 
     t0, paused, acc = time.time(), 0.0, torch.zeros(6, device=dev)  # loss, ce, align sums, correct, scored, bases
-    for sig, seqs, ws, cs in dl:
+    for sig, valid, seqs, ws, cs in dl:
         if step >= stop:
             break
         if step == decay_start and rank == 0 and not os.path.exists(os.path.join(args.out, f"predecay_{step}.pt")):
@@ -326,9 +330,9 @@ def main():
             g["lr"] = lr
         tokens_in, targets, w, centers = (t.to(dev, non_blocking=True) for t in model.batch(seqs, ws, args.pad_to, cs))
         with torch.no_grad():
-            frames = encoder(sig.to(dev, non_blocking=True))
+            frames, plens = model.encode(sig.to(dev, non_blocking=True), valid)
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            loss, ce, align, correct, scored = step_fn(frames, tokens_in, targets, w, centers)
+            loss, ce, align, correct, scored = step_fn(frames, tokens_in, targets, w, centers, plens)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         gnorm = nn.utils.clip_grad_norm_(trainable.parameters(), args.clip)

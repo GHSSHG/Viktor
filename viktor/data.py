@@ -1,7 +1,10 @@
-"""Training windows (scripts/make_windows.py index) -> signal, label and per-base weights.
+"""Training windows (scripts/make_windows.py / make_windows_v3.py index) -> signal, label and per-base weights.
 
 The signal is read from pod5 on the fly and preprocessed exactly as at inference (chunking.dorado_scale on
-the child read, then the window x[win : win + 12288]); the label is fetched from the reference.
+the child read, then the window x[win : win + win_len], win_len 12288 except a read's short last chunk); collate
+repeat-pads a short window to the encoder granularity as at inference (Basecaller.encode drops the padded frames).
+The label is fetched from the reference (v3 read-start windows: ADAPTER[ad_i0:ad_i1] + reference), unless the row
+carries its own (label column: resolved v3 windows, possibly empty = the window holds no DNA).
 WindowDataset streams one split: each (rank, worker) owns a disjoint share of the index files (one per pod5
 file), loads a few reads at a time (all their windows) and yields from a shuffle buffer.
 Training windows also carry each label base's prefix frame (window-local encoder frame of its signal midpoint),
@@ -26,10 +29,12 @@ import pyarrow.parquet as pq
 import pysam
 import torch
 
-from .chunking import DNA_TRIM_START, dorado_scale
+from .chunking import DNA_TRIM_START, dorado_scale, repeat_pad
 
 SIZE = 12288
 STRIDE = 12  # signal samples per encoder frame
+GRANULARITY = STRIDE * 64  # short chunks are repeat-padded to a multiple of this (Dorado chunk_size_granularity)
+ADAPTER = "CCTGTACTTCGTTCAGTTACGTATTGCT"  # ligation adapter of v3 read-start labels (make_windows_v3.py)
 CRF_FRAME = 6  # signal samples per stage-6 (CRF) frame
 EDGE_WEIGHT = 0.5  # first and last base of a window
 BD = os.path.expanduser("~/Work/BasecallerData")
@@ -88,21 +93,27 @@ def read_signals(reader, rows, mean, stdev):
         raw, offset, scale, pore, flow_cell = recs[r["parent_id"]]
         child = raw[r["split_start"]: r["split_start"] + r["num_samples"]]
         # copy: a view would keep the whole scaled read alive (the shuffle buffer holds thousands of windows)
-        out.append(dorado_scale(child, offset, scale, mean, stdev, pore, flow_cell)[r["win"]: r["win"] + SIZE].copy())
+        x = dorado_scale(child, offset, scale, mean, stdev, pore, flow_cell)
+        out.append(x[r["win"]: r["win"] + win_len(r)].copy())
     return out
 
 
+def win_len(r):
+    return r.get("win_len") or SIZE
+
+
 def _own(r, k):
-    """Per-row label / weights / centers of a head window (make_head_labels.py); None for reference-labelled rows."""
+    """Per-row weights / centers of a head window (make_head_labels.py); None for reference-labelled rows."""
     v = r.get(k)
     return v if v is not None and len(v) else None
 
 
 def label(fa, r):
-    if _own(r, "label") is not None:
+    if r.get("label") is not None:  # own label (head / resolved windows; "" = no DNA in the window)
         return r["label"]
     s = fa.fetch(r["contig"], r["g_lo"], r["g_hi"]).upper()
-    return s.translate(_COMP)[::-1] if r["strand"] == "-" else s
+    s = s.translate(_COMP)[::-1] if r["strand"] == "-" else s
+    return ADAPTER[r["ad_i0"]:r["ad_i1"]] + s if r.get("ad_i1") else s
 
 
 def base_weights(r, seq):
@@ -113,7 +124,8 @@ def base_weights(r, seq):
     for lo, hi in zip(r["mask_lo"], r["mask_hi"]):
         w[lo:hi] = 0
     w[np.frombuffer(seq.encode(), np.uint8) == ord("N")] = 0
-    w[[0, -1]] *= EDGE_WEIGHT
+    if len(w):
+        w[[0, -1]] *= EDGE_WEIGHT
     return w
 
 
@@ -141,9 +153,13 @@ def _centers(r, flat, off, n, f0, fx):
     e[0], e[n] = f0, fx + 1
     e[1:n] = f0 + np.cumsum(flat[off:off + n - 1], dtype=np.int64)
     mid = CRF_FRAME // 2 * (e[:-1] + e[1:])
-    lo, hi = np.searchsorted(mid, A), np.searchsorted(mid, A + SIZE)
-    assert hi - lo == r["n_bases"], (r["read_id"], r["win"])
-    return ((mid[lo:hi] - A - STRIDE / 2) / STRIDE).astype(np.float32)
+    lo, hi = np.searchsorted(mid, A), np.searchsorted(mid, A + win_len(r))
+    mid = mid[lo:hi]
+    if r.get("ad_i1"):  # v3 read start: its adapter bases (entry frames ad_e; the last one exits at f_first) come first
+        ea = np.append(np.asarray(r["ad_e"], np.int64), e[0])
+        mid = np.concatenate([(CRF_FRAME // 2 * (ea[:-1] + ea[1:]))[r["ad_i0"]:r["ad_i1"]], mid])
+    assert len(mid) == r["n_bases"], (r["read_id"], r["win"])
+    return ((mid - A - STRIDE / 2) / STRIDE).astype(np.float32)
 
 
 def base_centers(r, flat, segs=None):
@@ -154,6 +170,8 @@ def base_centers(r, flat, segs=None):
     signal)."""
     if _own(r, "lc") is not None:
         return np.asarray(r["lc"], np.float32)
+    if r.get("seg_off") is None and segs is None:  # resolved v3 windows: no alignment target
+        return np.full(r["n_bases"], -1.0, np.float32)
     if segs is None:
         return _centers(r, flat, r["seg_off"], r["seg_n"], r["f_first"], r["f_exit"])
     A = r["win"] + DNA_TRIM_START
@@ -211,6 +229,8 @@ class WindowDataset(torch.utils.data.IterableDataset):
                 cache = os.path.join(os.path.dirname(path), "dwell", os.path.basename(path)[:-len(".parquet")] + ".npy")
                 if os.path.exists(cache):
                     flat = np.load(cache, mmap_mode="r")
+                elif "label" in idx.columns and "contig" not in idx.columns:
+                    pass  # resolved v3 windows: own labels, no alignment
                 else:
                     flat, segs = load_segments(os.path.join(self.stage6, os.path.basename(path)),
                                                idx["read_id"].unique(), self.segments)
@@ -222,6 +242,7 @@ class WindowDataset(torch.utils.data.IterableDataset):
                             seq = label(fa, r)
                             try:
                                 centers = base_centers(r, flat, segs)
+                                assert len(centers) == len(seq), "label / alignment length"
                             except (AssertionError, KeyError) as e:  # inconsistent alignment: skip the window
                                 print(f"skip window {r['read_id']} {r['win']}: {e!r}", flush=True)
                                 continue
@@ -246,6 +267,11 @@ class MixedDataset(torch.utils.data.IterableDataset):
 
 
 def collate(items):
-    """(signal [B, 1, 12288], labels, weights[, base frames]) from WindowDataset or load_windows items."""
-    sig = torch.from_numpy(np.stack([it[0] for it in items]))[:, None]
-    return (sig, *([it[i] for it in items] for i in range(1, len(items[0]))))
+    """(signal [B, 1, 12288], real samples per window [B], labels, weights[, base frames]) from WindowDataset or
+    load_windows items. A short window is repeat-padded to the granularity (as at inference), then zero-padded."""
+    sig = np.zeros((len(items), 1, SIZE), np.float16)
+    for b, it in enumerate(items):
+        x = repeat_pad(it[0], GRANULARITY)
+        sig[b, 0, :len(x)] = x
+    valid = torch.tensor([len(it[0]) for it in items])
+    return (torch.from_numpy(sig), valid, *([it[i] for it in items] for i in range(1, len(items[0]))))

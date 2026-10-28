@@ -72,9 +72,9 @@ def max_homopolymer(s):
 
 def load_model(model_dir, init, dev):
     encoder = load_dorado_encoder(model_dir).to(dev, torch.float16).eval().use_koi()
-    model = Basecaller(encoder, get_tokenizer("base"))
-    model.set_encoder_trainable(False)
     s = torch.load(init, map_location="cpu", weights_only=False)
+    model = Basecaller(encoder, get_tokenizer(s["args"].get("tokenizer", "base")))
+    model.set_encoder_trainable(False)
     model.projector.load_state_dict(s["projector"])
     model.decoder.load_state_dict(s["decoder"])
     model.projector.to(dev)
