@@ -116,14 +116,15 @@ class Basecaller(nn.Module):
         else:
             pos = torch.arange(P + T, device=prefix.device).expand(B, -1)
             tok = pos >= plens[:, None]
-            x = torch.where(tok[..., None], emb.gather(1, (pos - plens[:, None]).clamp(0, T - 1)[..., None].expand(-1, -1, d)),
-                            prefix.gather(1, pos.clamp(max=P - 1)[..., None].expand(-1, -1, d)))
+            # gathers in fp32: their backward (scatter-add) has no bf16 atomics in Triton on sm80
+            x = torch.where(tok[..., None], emb.float().gather(1, (pos - plens[:, None]).clamp(0, T - 1)[..., None].expand(-1, -1, d)),
+                            prefix.float().gather(1, pos.clamp(max=P - 1)[..., None].expand(-1, -1, d)))
             at = plens[:, None] + torch.arange(T, device=prefix.device)  # sequence position of each token
         if centers is None or self.align is None:
             h, qk = self.decoder(x), []
         else:
             h, qk = self.decoder.forward_probe(x, self.align.layers)
-        logits = self.decoder.head(h.gather(1, at[..., None].expand(-1, -1, h.shape[-1])))
+        logits = self.decoder.head(h.float().gather(1, at[..., None].expand(-1, -1, h.shape[-1])))
         ce = F.cross_entropy(logits.flatten(0, 1).float(), targets.flatten(), ignore_index=PAD,
                              reduction="none").view_as(targets)
         scored = w > 0
@@ -149,7 +150,7 @@ class Basecaller(nn.Module):
         kv = [h * self.cfg.n_kv_heads // self.cfg.n_heads for h in heads]
         total = 0.0
         for q, k in qk:
-            qt = q[:, :, heads].gather(1, at[..., None, None].expand(-1, -1, len(heads), q.shape[-1]))
+            qt = q[:, :, heads].float().gather(1, at[..., None, None].expand(-1, -1, len(heads), q.shape[-1]))
             s = torch.einsum("bthd,bphd->bhtp", qt, k[:, :P, kv]) * q.shape[-1] ** -0.5
             logq = torch.log_softmax(s.float().masked_fill(out, float("-inf")), -1)
             kl = (tgt.exp() * (tgt - logq)).masked_fill(out, 0.0).sum(-1)  # [B, heads, T]
