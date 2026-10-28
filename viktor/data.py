@@ -92,13 +92,23 @@ def read_signals(reader, rows, mean, stdev):
     return out
 
 
+def _own(r, k):
+    """Per-row label / weights / centers of a head window (make_head_labels.py); None for reference-labelled rows."""
+    v = r.get(k)
+    return v if v is not None and len(v) else None
+
+
 def label(fa, r):
+    if _own(r, "label") is not None:
+        return r["label"]
     s = fa.fetch(r["contig"], r["g_lo"], r["g_hi"]).upper()
     return s.translate(_COMP)[::-1] if r["strand"] == "-" else s
 
 
 def base_weights(r, seq):
     """Read weight per base; masked and N bases 0; first and last base x EDGE_WEIGHT."""
+    if _own(r, "lw") is not None:  # head window: the weights are stored (0 for bases of unknown identity)
+        return np.asarray(r["lw"], np.float32) * r["w"]
     w = np.full(len(seq), r["w"], np.float32)
     for lo, hi in zip(r["mask_lo"], r["mask_hi"]):
         w[lo:hi] = 0
@@ -142,6 +152,8 @@ def base_centers(r, flat, segs=None):
     segs None: the row names its segment (flat = the index's dwell/<file>.npy). Otherwise (load_segments) the
     segment is the one holding the window in both signal and reference (segments of fold-back reads overlap in
     signal)."""
+    if _own(r, "lc") is not None:
+        return np.asarray(r["lc"], np.float32)
     if segs is None:
         return _centers(r, flat, r["seg_off"], r["seg_n"], r["f_first"], r["f_exit"])
     A = r["win"] + DNA_TRIM_START
