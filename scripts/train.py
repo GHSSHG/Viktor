@@ -51,7 +51,9 @@ import torch.nn as nn
 
 from viktor import Basecaller, DecodeEngine, get_tokenizer, load_dorado_encoder
 from viktor.model import AlignConfig
-from viktor.data import MixedDataset, WindowDataset, collate, index_files, load_windows, part_paths, split_rows
+from viktor.chunking import repeat_pad
+from viktor.data import (GRANULARITY, SIZE, MixedDataset, WindowDataset, collate, index_files, load_windows, part_paths,
+                         split_rows)
 
 
 class Trainable(nn.Module):
@@ -152,16 +154,26 @@ def fixed_windows(index_dir, split, n, mean, stdev, part="part1"):
 
 @torch.no_grad()
 def dorado_calls(model_dir, encoder, wins, dev):
+    """Dorado SUP calls (koi encoder + CRF head + koi beam search). A short window is encoded at its repeat-padded
+    length and decoded over its real frames only, as Dorado does."""
     import tomllib
 
     from scripts.basecall_crf import CRFHead, beam_search
     head = CRFHead(model_dir).to(dev).eval()
     with open(os.path.join(model_dir, "config.toml"), "rb") as f:
         q = tomllib.load(f)["qscore"]
-    calls = []
-    for i in range(0, len(wins), 256):
-        x = torch.from_numpy(np.stack([w[0] for w in wins[i:i + 256]])).to(dev)[:, None]
-        calls += [c[0] for c in beam_search(head(encoder(x)), q["scale"], q["bias"])]
+    calls = [None] * len(wins)
+    full = [i for i, w in enumerate(wins) if len(w[0]) == SIZE]
+    for j in range(0, len(full), 256):
+        ids = full[j:j + 256]
+        x = torch.from_numpy(np.stack([wins[i][0] for i in ids])).to(dev)[:, None]
+        for i, c in zip(ids, beam_search(head(encoder(x)), q["scale"], q["bias"])):
+            calls[i] = c[0]
+    for i, (x, _, _) in enumerate(wins):
+        if calls[i] is None:
+            sig = torch.from_numpy(repeat_pad(x, GRANULARITY)).to(dev)
+            frames, _ = encoder.encode_chunks(sig, [len(sig)], [len(x)])
+            calls[i] = beam_search(head(frames[None]), q["scale"], q["bias"])[0][0]
     return calls
 
 
@@ -181,7 +193,7 @@ def eval_val(model, val, batch, dev, prefix="val"):
 
 
 @torch.no_grad()
-def eval_heldout(model, heldout, batch, dev):
+def heldout_calls(model, heldout, batch, dev):
     """Free greedy decoding on a bf16 copy (the fused inference kernels need bf16 weights)."""
     inf = Basecaller(model.encoder, model.tokenizer, model.cfg)
     inf.projector = copy.deepcopy(model.projector).to(torch.bfloat16).eval()
@@ -199,7 +211,11 @@ def eval_heldout(model, heldout, batch, dev):
         preds += [model.tokenizer.decode(t) for t in toks]
     del eng, inf
     torch.cuda.empty_cache()
-    return {f"heldout/{k}": v for k, v in identity_stats(preds[:len(heldout)], heldout).items()}
+    return preds[:len(heldout)]
+
+
+def eval_heldout(model, heldout, batch, dev):
+    return {f"heldout/{k}": v for k, v in identity_stats(heldout_calls(model, heldout, batch, dev), heldout).items()}
 
 
 def main():
