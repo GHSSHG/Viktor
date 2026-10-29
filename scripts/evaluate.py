@@ -42,7 +42,7 @@ def strict(pred, ref, row):
         n, num = int(num), ""
         mid = max(0, min(ri + n, hi) - max(ri, lo))  # reference bases of this run inside [lo, hi)
         if ch == "I":
-            mid = n if lo <= ri < hi else 0
+            mid = n if lo <= ri < hi or ri == hi == len(ref) else 0  # past the label end: counted unless trimmed
             ed, ed_mid, q_mid = ed + n, ed_mid + mid, q_mid + mid
             continue
         if ch != "=":
