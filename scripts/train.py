@@ -45,6 +45,7 @@ import edlib
 import numpy as np
 import polars as pl
 import torch
+import torch._inductor.config
 import torch.distributed as dist
 import torch.nn as nn
 
@@ -237,7 +238,6 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
     if args.no_split_reductions:
-        import torch._inductor.config
         torch._inductor.config.split_reductions = False
 
     dist.init_process_group("nccl")
