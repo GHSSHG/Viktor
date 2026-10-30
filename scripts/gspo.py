@@ -9,14 +9,14 @@ scan   greedy-decode 'train' windows (w == 1) of the --windows sources (DIR[:PAR
        larger --pool-scan later (or a rerun after a crash) only decodes the rows not yet in the scan table
        (OUT/scan/*.parquet: src, file, row, identity, longest label homopolymer, label length, call, ended; one table
        per --init, checked by OUT/scan/init.txt).
-dorado Dorado SUP (CRF head, beam search) on the scanned windows with DNA and identity < --hard-ident, plus up to
-       --pool-max of the 'fine' ones (identity in [--hard-ident, 1)), that the cache (--dorado-cache, default
+dorado Dorado SUP (CRF head, beam search) on the scanned windows with DNA and identity < --derail-ident, up to
+       2 x --pool-max of the 'hard' ones (< --hard-ident) and up to --pool-max of the 'fine' ones (< 1), that the cache (--dorado-cache, default
        OUT/dorado) does not have yet. Per window: Dorado's identity, the call-to-call identity, the model's and
        Dorado's error positions (scored reference bases) and 'shared' = the share of the model's errors that Dorado
        also makes within +-2 bases. Where both err at the same place the label is the likelier culprit (the two share
        the Dorado encoder, so agreement is evidence, not proof).
 pool   (one process) classes from the scan table: derail (identity < --derail-ident), hard (< --hard-ident), fine
-       (< 1, Dorado-checked only), perfect, empty (no DNA); drops label suspects (model and Dorado identity <
+       (< 1; hard and fine: Dorado-checked only), perfect, empty (no DNA); drops label suspects (model and Dorado identity <
        --suspect-ident and shared >= --suspect-shared), in fine windows zeroes the label weights within +-2 bases of
        every shared error (a likely label error neither rewards nor penalises), keeps up to --pool-max windows of each class
        (random) and stores signals, real samples, labels, base weights, class and source in OUT/pool.pt.
@@ -240,8 +240,10 @@ def near(a, b, tol=SUSPECT_TOL):
 
 def dorado_check(args, dev, rank, world):
     sc = read_table(os.path.join(args.out, "scan")).filter((pl.col("n_bases") > 0) & (pl.col("ident") < 1)).sort(KEY)
+    hard = sc.filter(pl.col("ident").is_between(args.derail_ident, args.hard_ident, closed="left"))
     fine = sc.filter(pl.col("ident") >= args.hard_ident)
-    sc = pl.concat([sc.filter(pl.col("ident") < args.hard_ident), fine.sample(min(args.pool_max, fine.height), seed=args.seed)])
+    sc = pl.concat([sc.filter(pl.col("ident") < args.derail_ident), hard.sample(min(2 * args.pool_max, hard.height), seed=args.seed),
+                    fine.sample(min(args.pool_max, fine.height), seed=args.seed)])
     cache = read_table(args.dorado_cache)
     if cache is not None:
         sc = sc.join(cache.select(KEY), on=KEY, how="anti")
@@ -298,8 +300,8 @@ def build_pool(args):
     print(sc.group_by("src", "cls").agg(pl.len().alias("windows"), pl.col("suspect").sum().alias("suspect"),
                                         pl.col("d_ident").is_not_null().sum().alias("dorado"))
           .sort("src", "cls"), flush=True)
-    # fine windows only with a Dorado check (their few errors are the ones a label error would distort most)
-    keep = sc.filter(~pl.col("suspect") & ((pl.col("cls") != 2) | pl.col("d_ident").is_not_null()))
+    # hard and fine windows only with a Dorado check (a sample of them is checked)
+    keep = sc.filter(~pl.col("suspect") & (~pl.col("cls").is_in([1, 2]) | pl.col("d_ident").is_not_null()))
     pick = pl.concat([keep.filter(pl.col("cls") == c).sample(min(args.pool_max, int((keep["cls"] == c).sum())), seed=args.seed)
                       for c in range(len(CLASSES))]).sort(KEY)
     srcs = sources(args.windows)
