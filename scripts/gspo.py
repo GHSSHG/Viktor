@@ -17,8 +17,8 @@ dorado Dorado SUP (CRF head, beam search) on the scanned windows with DNA and id
        the Dorado encoder, so agreement is evidence, not proof).
 pool   (one process) classes from the scan table: derail (identity < --derail-ident), hard (< --hard-ident), fine
        (< 1, Dorado-checked only), perfect, empty (no DNA); drops label suspects (model and Dorado identity <
-       --suspect-ident and shared >= --suspect-shared), zeroes the label weights within +-2 bases of every shared
-       error (a likely label error neither rewards nor penalises), keeps up to --pool-max windows of each class
+       --suspect-ident and shared >= --suspect-shared), in fine windows zeroes the label weights within +-2 bases of
+       every shared error (a likely label error neither rewards nor penalises), keeps up to --pool-max windows of each class
        (random) and stores signals, real samples, labels, base weights, class and source in OUT/pool.pt.
 train  every step: --windows-per-step pool windows drawn by class shares --mix, --group samples each (DecodeEngine,
        temperature --temperature) -> reward (a call that never ends is scored as it stands). Advantage = reward
@@ -313,7 +313,7 @@ def build_pool(args):
     masked = 0
     for src, _, rows, wins in stream(jobs, 32):
         for r, (x, seq, w) in zip(rows, wins):
-            w2 = mask_shared(w, r["v_pos"], r["d_pos"])
+            w2 = mask_shared(w, r["v_pos"], r["d_pos"]) if r["cls"] == 2 else w
             masked += int(((w > 0) & (w2 == 0)).sum())
             for k, v in zip(pool, ((x, seq, w2), seq, w2, r["ident"], r["hp"], r["cls"], src)):
                 pool[k].append(v)
@@ -451,8 +451,8 @@ def train(args, dev, rank, world):
                 a = torch.tensor([adv[b, j] for b, j in mb], device=dev, dtype=torch.float32)
                 pg = -torch.minimum(s * a, s.clamp(1 - args.eps, 1 + args.eps) * a)
                 (pg.sum() / len(mine)).backward()
-                stats["pg"] += float(pg.sum()); stats["n"] += len(mb)
-                stats["clip"] += float(((s - 1).abs() > args.eps).sum()); stats["ratio"] += float((s - 1).abs().sum())
+                stats["pg"] += float(pg.detach().sum()); stats["n"] += len(mb)
+                stats["clip"] += float(((s - 1).abs() > args.eps).sum()); stats["ratio"] += float((s.detach() - 1).abs().sum())
             for i in range(0, len(wins), args.micro):
                 wb_ = wins[i:i + args.micro]
                 with torch.autocast("cuda", dtype=torch.bfloat16):
