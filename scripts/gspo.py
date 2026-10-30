@@ -1,7 +1,8 @@
 """GSPO (group sequence policy optimisation) on top of an SFT checkpoint, data-parallel over torchrun ranks.
 
 Reward / identity everywhere below: strict identity 1 - errors / max(call length, label length) (NW), errors on weight-0
-label bases not counted; a window without DNA (label "") scores 1 if the call has at most EMPTY_MAX bases, else 0.
+label bases not counted; a window without DNA (label "") scores 1 if the call has at most EMPTY_MAX bases, else
+EMPTY_MAX / call length (a shorter wrong call still scores higher).
 
 scan   greedy-decode 'train' windows (w == 1) of the --windows sources (DIR[:PART[:WEIGHT]] as train.py; a source is
        named by its index dir) with the SFT model until --pool-scan windows are scanned in all (shared by weight, then
@@ -31,7 +32,8 @@ train  every step: --windows-per-step pool windows drawn by class shares --mix, 
        engine forces after a tail token was not sampled and is left out of s. The rollout is split into --updates
        minibatches, one optimiser step each; pi_old = the policy before the first. Every rank rolls out its own
        --windows-per-step windows; gradients are averaged over ranks before each optimiser step (by hand: the
-       number of live groups differs per rank), so the replicas stay identical.
+       number of live groups differs per rank), so the replicas stay identical. Learning rate: linear warmup over
+       --warmup steps, constant, linear decay to 0 from --decay-start to --steps.
        Evaluation (rank 0, every --eval-every steps, and at the start): greedy decoding of the stratified
        --eval-windows set scored as scripts/evaluate.py (v3/<stratum>/..., v3/natural/...), and of fixed windows of
        each --eval source (DIR:PART:SPLIT, sampled as train.py's heldout; train.py's identity). Temperature guard
@@ -82,7 +84,7 @@ def max_homopolymer(s):
 
 def strict_identity(call, ref, scored):
     if not ref:
-        return float(len(call) <= EMPTY_MAX)
+        return 1.0 if len(call) <= EMPTY_MAX else EMPTY_MAX / len(call)
     return 1 - int(scored[ref_errors(call, ref)].sum()) / max(len(call), len(ref))
 
 
@@ -346,6 +348,12 @@ def token_logprobs(model, frames, plens, seqs, ended):
     return lp, mask
 
 
+def lr_at(args, step):
+    """Linear warmup over --warmup steps, constant, then linear decay to 0 from --decay-start to --steps."""
+    lr = args.lr * min(1.0, (step + 1) / args.warmup)
+    return lr if step < args.decay_start else lr * (args.steps - step) / (args.steps - args.decay_start)
+
+
 def train(args, dev, rank, world):
     model = load_model(args.model_dir, args.init, dev)
     trainable = nn.ModuleList([model.projector, model.decoder])
@@ -414,6 +422,9 @@ def train(args, dev, rank, world):
     while step < args.steps:
         t0 = time.time()
         paused = temperature_guard(rank, dev, args.temp_pause, args.temp_resume)
+        lr = lr_at(args, step)
+        for g in opt.param_groups:
+            g["lr"] = lr
         pick = np.concatenate([rng.choice(ix, k) for ix, k in zip(by_cls, rng.multinomial(B, mix)) if k])
         cls = pool["cls"][pick]
         sel = torch.from_numpy(pick)
@@ -483,7 +494,7 @@ def train(args, dev, rank, world):
         rec = {f"reward_cls/{c}": per_cls[2 * i] / per_cls[2 * i + 1] for i, c in enumerate(CLASSES) if per_cls[2 * i + 1]}
         rec |= {"reward/mean": r_sum / n_r, "reward/best_of_group": best / n_win, "reward/derail": der / n_r,
                "groups_live": n_live / n_win, "ended": n_end / n_calls, "pg": pg / n, "ce": ce / n_win,
-               "clip_frac": clip / n, "ratio_dev": ratio / n, "grad_norm": float(gnorm), "lr": args.lr,
+               "clip_frac": clip / n, "ratio_dev": ratio / n, "grad_norm": float(gnorm), "lr": lr,
                "s_rollout": t_roll, "s_per_step": time.time() - t0 - paused, "paused_s": paused,
                "gpu/temp": torch.cuda.temperature(dev)}
         if step % args.eval_every == 0 or step == args.steps:
@@ -529,7 +540,9 @@ def main():
     ap.add_argument("--windows-per-step", type=int, default=32)
     ap.add_argument("--group", type=int, default=16)
     ap.add_argument("--temperature", type=float, default=1.0)
-    ap.add_argument("--lr", type=float, default=1e-6)
+    ap.add_argument("--lr", type=float, default=1e-6, help="peak learning rate")
+    ap.add_argument("--warmup", type=int, default=50)
+    ap.add_argument("--decay-start", type=int, default=1400, help="linear decay to 0 from this step to --steps")
     ap.add_argument("--eps", type=float, default=4e-4, help="GSPO sequence-ratio clip")
     ap.add_argument("--std-floor", type=float, default=0.003, help="advantage: group reward std floor")
     ap.add_argument("--updates", type=int, default=2, help="optimiser steps per rollout")
