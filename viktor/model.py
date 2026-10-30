@@ -41,11 +41,28 @@ class Basecaller(nn.Module):
             raise RuntimeError("the koi encoder is inference-only (no gradients); train the PyTorch encoder instead")
         self.encoder.requires_grad_(trainable)
 
-    def logits(self, frames, tokens_in):
-        """Teacher forcing from encoder frames [B, T, d_enc]: logits for every token position, [B, T_tok, vocab]."""
+    def logits(self, frames, tokens_in, plens=None):
+        """Teacher forcing from encoder frames [B, T, d_enc]: logits for every token position, [B, T_tok, vocab].
+        plens: real prefix frames per window, as in weighted_loss."""
+        x, at = self.sequence(frames, tokens_in, plens)
+        h = self.decoder(x)
+        return self.decoder.head(h.float().gather(1, at[..., None].expand(-1, -1, h.shape[-1])))
+
+    def sequence(self, frames, tokens_in, plens=None):
+        """Decoder input [B, P + T, d] (window b: [its plens[b] frames | tokens | padding]) and each token's
+        sequence position [B, T]."""
         prefix = self.projector(frames.to(self.projector[0].weight.dtype))
-        x = torch.cat([prefix, self.decoder.embed(tokens_in)], 1)
-        return self.decoder.head(self.decoder(x)[:, prefix.shape[1]:])
+        B, P, d = prefix.shape
+        T = tokens_in.shape[1]
+        emb = self.decoder.embed(tokens_in)
+        if plens is None:
+            return torch.cat([prefix, emb], 1), torch.arange(P, P + T, device=prefix.device).expand(B, T)
+        pos = torch.arange(P + T, device=prefix.device).expand(B, -1)
+        tok = pos >= plens[:, None]
+        # gathers in fp32: their backward (scatter-add) has no bf16 atomics in Triton on sm80
+        x = torch.where(tok[..., None], emb.float().gather(1, (pos - plens[:, None]).clamp(0, T - 1)[..., None].expand(-1, -1, d)),
+                        prefix.float().gather(1, pos.clamp(max=P - 1)[..., None].expand(-1, -1, d)))
+        return x, plens[:, None] + torch.arange(T, device=prefix.device)
 
     def forward(self, signal, tokens_in):
         return self.logits(self.encoder(signal), tokens_in)
@@ -107,19 +124,8 @@ class Basecaller(nn.Module):
         [its plens[b] frames | tokens | padding], as decoded at inference (causal: the padding is never attended).
         Returns (loss, ce, align, correct, scored): loss = ce + weight * align; greedy-correct and scored targets
         counted where the weight is positive."""
-        prefix = self.projector(frames.to(self.projector[0].weight.dtype))
-        B, P, d = prefix.shape
-        T = tokens_in.shape[1]
-        emb = self.decoder.embed(tokens_in)
-        if plens is None:
-            x, at = torch.cat([prefix, emb], 1), torch.arange(P, P + T, device=prefix.device).expand(B, T)
-        else:
-            pos = torch.arange(P + T, device=prefix.device).expand(B, -1)
-            tok = pos >= plens[:, None]
-            # gathers in fp32: their backward (scatter-add) has no bf16 atomics in Triton on sm80
-            x = torch.where(tok[..., None], emb.float().gather(1, (pos - plens[:, None]).clamp(0, T - 1)[..., None].expand(-1, -1, d)),
-                            prefix.float().gather(1, pos.clamp(max=P - 1)[..., None].expand(-1, -1, d)))
-            at = plens[:, None] + torch.arange(T, device=prefix.device)  # sequence position of each token
+        x, at = self.sequence(frames, tokens_in, plens)
+        P = frames.shape[1]
         if centers is None or self.align is None:
             h, qk = self.decoder(x), []
         else:
