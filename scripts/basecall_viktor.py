@@ -45,8 +45,8 @@ def overlap_cut(a, b, ov_frames, rate):
         for _ in range(n):
             if ia >= half and op in "=X":
                 return p + ia, ib
-            ia += op in "=XD"
-            ib += op in "=XI"
+            ia += op in "=XI"  # edlib: I = extra base in the query (q, from a), D = extra base in the target (b)
+            ib += op in "=XD"
     return p + half, ib
 
 
