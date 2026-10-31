@@ -91,8 +91,8 @@ def main():
 
     dev = torch.device("cuda")
     enc = load_dorado_encoder(args.model_dir).to(dev, torch.float16).eval().use_koi()
-    model = Basecaller(enc, get_tokenizer("base"))
     s = torch.load(args.snap, map_location="cpu", weights_only=False)
+    model = Basecaller(enc, get_tokenizer(s["args"].get("tokenizer", "base")))
     model.projector.load_state_dict(s["projector"])
     model.decoder.load_state_dict(s["decoder"])
     model.projector.to(dev, torch.bfloat16)
