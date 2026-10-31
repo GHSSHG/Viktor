@@ -49,7 +49,7 @@ import torch._inductor.config
 import torch.distributed as dist
 import torch.nn as nn
 
-from viktor import Basecaller, DecodeEngine, get_tokenizer, load_dorado_encoder
+from viktor import Basecaller, DecodeEngine, load_dorado_encoder
 from viktor.model import AlignConfig
 from viktor.chunking import repeat_pad
 from viktor.data import (GRANULARITY, SIZE, MixedDataset, WindowDataset, collate, index_files, load_windows, part_paths,
@@ -235,6 +235,7 @@ def main():
     ap.add_argument("--clip", type=float, default=1.0)
     ap.add_argument("--pad-to", type=int, default=128, help="pad label lengths to a multiple (compile shapes)")
     ap.add_argument("--tokenizer", choices=["base", "4mer"], default="base", help="decoder output unit")
+    ap.add_argument("--layers", type=int, default=8, help="decoder layers")
     ap.add_argument("--align-weight", type=float, default=0.1, help="attention alignment loss weight (0 = off)")
     ap.add_argument("--align-layers", default="2,4", help="decoder layers with supervised heads")
     ap.add_argument("--align-heads", default="0,4", help="supervised query heads in each of those layers")
@@ -278,7 +279,7 @@ def main():
     stop = min(total, args.max_steps or total)
 
     encoder = load_dorado_encoder(args.model_dir).to(dev, torch.float16).eval().use_koi()
-    model = Basecaller(encoder, get_tokenizer(args.tokenizer))
+    model = Basecaller.from_args(encoder, vars(args))
     model.set_encoder_trainable(False)
     if args.align_weight > 0:
         model.align = AlignConfig(tuple(int(x) for x in args.align_layers.split(",")),

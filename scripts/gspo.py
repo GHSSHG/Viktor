@@ -68,7 +68,7 @@ import torch.nn as nn
 from scripts.evaluate import EMPTY_MAX, scores
 from scripts.train import (dorado_calls, fixed_windows, heldout_calls, identity_stats, parse_source, ref_errors,
                            temperature_guard)
-from viktor import Basecaller, DecodeEngine, get_tokenizer, load_dorado_encoder
+from viktor import Basecaller, DecodeEngine, load_dorado_encoder
 from viktor.data import collate, index_files, load_windows, part_paths, split_rows
 from viktor.tokenizer import EOS, PAD
 
@@ -96,7 +96,7 @@ def sources(specs):
 def load_model(model_dir, init, dev):
     encoder = load_dorado_encoder(model_dir).to(dev, torch.float16).eval().use_koi()
     s = torch.load(init, map_location="cpu", weights_only=False)
-    model = Basecaller(encoder, get_tokenizer(s["args"].get("tokenizer", "base")))
+    model = Basecaller.from_args(encoder, s["args"])
     model.set_encoder_trainable(False)
     model.projector.load_state_dict(s["projector"])
     model.decoder.load_state_dict(s["decoder"])
@@ -407,7 +407,8 @@ def train(args, dev, rank, world):
     def save():
         if rank == 0:
             state = {"step": step, "projector": model.projector.state_dict(), "decoder": model.decoder.state_dict(),
-                     "opt": opt.state_dict(), "args": vars(args) | {"tokenizer": "4mer" if model.tokenizer.k == 4 else "base"},
+                     "opt": opt.state_dict(), "args": vars(args) | {"tokenizer": "4mer" if model.tokenizer.k == 4 else "base",
+                                                          "layers": model.cfg.n_layers},
                      "wandb_id": wb.id}
             torch.save(state, ckpt + ".tmp")
             os.replace(ckpt + ".tmp", ckpt)

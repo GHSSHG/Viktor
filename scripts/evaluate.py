@@ -21,7 +21,7 @@ import polars as pl
 import torch
 
 from scripts.train import dorado_calls, heldout_calls
-from viktor import Basecaller, get_tokenizer, load_dorado_encoder
+from viktor import Basecaller, load_dorado_encoder
 from viktor.data import load_windows
 
 EMPTY_MAX = 4
@@ -97,7 +97,7 @@ def main():
     print("dorado", json.dumps(res["dorado"]), flush=True)
     for path in args.snaps:
         s = torch.load(path, map_location="cpu", weights_only=False)
-        model = Basecaller(encoder, get_tokenizer(s["args"].get("tokenizer", "base")))
+        model = Basecaller.from_args(encoder, s["args"])
         model.projector.load_state_dict(s["projector"])
         model.decoder.load_state_dict(s["decoder"])
         model.projector.to(dev)

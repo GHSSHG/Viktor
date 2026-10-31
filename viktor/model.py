@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 from .decoder import Decoder, DecoderConfig
 from .encoder import DoradoEncoder
-from .tokenizer import PAD, KmerTokenizer
+from .tokenizer import PAD, KmerTokenizer, get_tokenizer
 
 
 @dataclass
@@ -35,6 +35,12 @@ class Basecaller(nn.Module):
         self.projector = nn.Sequential(nn.Linear(encoder.d_model, d), nn.GELU(), nn.Linear(d, d))
         self.decoder = Decoder(self.cfg)
         self.align: Optional[AlignConfig] = None
+
+    @classmethod
+    def from_args(cls, encoder: DoradoEncoder, args: dict):
+        """The model of a training run's args (a snapshot's "args"): tokenizer and decoder depth."""
+        tok = get_tokenizer(args.get("tokenizer", "base"))
+        return cls(encoder, tok, DecoderConfig(vocab_size=tok.vocab_size, n_layers=args.get("layers", 8)))
 
     def set_encoder_trainable(self, trainable: bool):
         if trainable and getattr(self.encoder, "koi", None) is not None:

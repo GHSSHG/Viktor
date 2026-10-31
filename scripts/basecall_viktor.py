@@ -19,7 +19,7 @@ import pod5
 import torch
 
 from scripts.basecall_crf import STRIDE
-from viktor import Basecaller, DecodeEngine, get_tokenizer, load_dorado_encoder
+from viktor import Basecaller, DecodeEngine, load_dorado_encoder
 from viktor.chunking import chunk_read, repeat_pad, scale_record
 
 
@@ -93,7 +93,7 @@ def main():
     dev = torch.device("cuda")
     enc = load_dorado_encoder(args.model_dir).to(dev, torch.float16).eval().use_koi()
     s = torch.load(args.snap, map_location="cpu", weights_only=False)
-    model = Basecaller(enc, get_tokenizer(s["args"].get("tokenizer", "base")))
+    model = Basecaller.from_args(enc, s["args"])
     model.projector.load_state_dict(s["projector"])
     model.decoder.load_state_dict(s["decoder"])
     model.projector.to(dev, torch.bfloat16)
