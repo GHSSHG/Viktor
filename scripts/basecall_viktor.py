@@ -83,6 +83,7 @@ def main():
     ap.add_argument("--read-ids", help="file with one read id per line (default: all reads)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--batch", type=int, default=256)
+    ap.add_argument("--overlap", type=int, help="chunk overlap in samples (default: the model's, 600)")
     ap.add_argument("--anchor-tail", action=argparse.BooleanOptionalAction, default=True,
                     help="reads >= one chunk: replace the short last chunk by a full chunk ending at the read end "
                          "(the decoder was only trained on full-length windows)")
@@ -101,13 +102,14 @@ def main():
     max_frames = enc.chunksize // enc.stride
     engine = DecodeEngine(model, args.batch, 2 * max_frames, max_frames)
 
+    overlap = args.overlap or enc.overlap
     ids = [l.strip() for l in open(args.read_ids)] if args.read_ids else None
     reads, items = {}, []  # items: (read_id, chunk_idx, start, end, padded signal)
     with pod5.Reader(args.pod5) as r:
         for rec in r.reads(selection=ids):
             x = scale_record(rec, enc.mean, enc.stdev)
             rid = str(rec.read_id)
-            spans = chunk_read(len(x), enc.chunksize, enc.overlap)
+            spans = chunk_read(len(x), enc.chunksize, overlap)
             if args.anchor_tail and len(x) >= enc.chunksize and spans[-1][1] - spans[-1][0] < enc.chunksize:
                 spans[-1] = (len(x) - enc.chunksize, len(x))
             reads[rid] = (len(x), spans)
@@ -136,7 +138,7 @@ def main():
                 f.write(f">{rid}_{ci}_{a}_{b}_{reads[rid][0]}\n{seq}\n")
     with open(args.out, "w") as f:
         for rid, (n, spans) in reads.items():
-            seq = stitch([calls[(rid, c)] for c in range(len(spans))], spans, n, enc.overlap)
+            seq = stitch([calls[(rid, c)] for c in range(len(spans))], spans, n, overlap)
             if seq:
                 f.write(f">{rid}\n{seq}\n")
 
