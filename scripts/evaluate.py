@@ -85,11 +85,14 @@ def main():
     ap.add_argument("--windows", required=True, help="make_windows parquet")
     ap.add_argument("--ref", required=True, help="reference FASTA of the windows' labels")
     ap.add_argument("--batch", type=int, default=256)
+    ap.add_argument("--encoder", choices=["koi", "torch"], default="koi", help="encoder kernels (torch: the PyTorch layers, fp16)")
     ap.add_argument("--out", required=True, help="results JSON")
     args = ap.parse_args()
 
     dev = torch.device("cuda")
-    encoder = load_dorado_encoder(args.model_dir).to(dev, torch.float16).eval().use_koi()
+    encoder = load_dorado_encoder(args.model_dir).to(dev, torch.float16).eval()
+    if args.encoder == "koi":
+        encoder.use_koi()
     rows = pl.read_parquet(args.windows).to_dicts()
     wins = load_windows(rows, encoder.mean, encoder.stdev, args.ref)
     calls = {"dorado": dorado_calls(args.model_dir, encoder, wins, dev)}

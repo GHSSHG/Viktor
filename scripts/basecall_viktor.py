@@ -83,6 +83,7 @@ def main():
     ap.add_argument("--read-ids", help="file with one read id per line (default: all reads)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--batch", type=int, default=256)
+    ap.add_argument("--encoder", choices=["koi", "torch"], default="koi", help="encoder kernels (torch: the PyTorch layers, fp16)")
     ap.add_argument("--overlap", type=int, help="chunk overlap in samples (default: the model's, 600)")
     ap.add_argument("--anchor-tail", action=argparse.BooleanOptionalAction, default=True,
                     help="reads >= one chunk: replace the short last chunk by a full chunk ending at the read end "
@@ -91,7 +92,9 @@ def main():
     args = ap.parse_args()
 
     dev = torch.device("cuda")
-    enc = load_dorado_encoder(args.model_dir).to(dev, torch.float16).eval().use_koi()
+    enc = load_dorado_encoder(args.model_dir).to(dev, torch.float16).eval()
+    if args.encoder == "koi":
+        enc.use_koi()
     s = torch.load(args.snap, map_location="cpu", weights_only=False)
     model = Basecaller.from_args(enc, s["args"])
     model.projector.load_state_dict(s["projector"])
