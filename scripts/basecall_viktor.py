@@ -92,10 +92,13 @@ def main():
     args = ap.parse_args()
 
     dev = torch.device("cuda")
-    enc = load_dorado_encoder(args.model_dir).to(dev, torch.float16).eval()
+    s = torch.load(args.snap, map_location="cpu", weights_only=False)
+    enc = load_dorado_encoder(args.model_dir)
+    if "encoder" in s:  # fine-tuned (train.py --train-encoder)
+        enc.load_state_dict(s["encoder"])
+    enc = enc.to(dev, torch.float16).eval()
     if args.encoder == "koi":
         enc.use_koi()
-    s = torch.load(args.snap, map_location="cpu", weights_only=False)
     model = Basecaller.from_args(enc, s["args"])
     model.projector.load_state_dict(s["projector"])
     model.decoder.load_state_dict(s["decoder"])

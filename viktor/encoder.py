@@ -14,6 +14,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -72,7 +73,7 @@ class SelfAttention(nn.Module):
         q, k, v = self.Wqkv(x).view(N, T, 3, self.nhead, self.head_dim).unbind(2)
         cos, sin = self.cos[:T], self.sin[:T]
         q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
-        if flash_attn_func is not None and x.is_cuda and x.dtype in (torch.float16, torch.bfloat16):
+        if flash_attn_func is not None and q.is_cuda and q.dtype in (torch.float16, torch.bfloat16):  # q: autocast dtype
             o = flash_attn_func(q, k, v, window_size=self.window)
         else:
             o = F.scaled_dot_product_attention(
@@ -123,6 +124,7 @@ class DoradoEncoder(nn.Module):
         self.tx_layer = lay
         self.d_model = lay["d_model"]
         self.koi = None
+        self.grad_ckpt = False  # training: recompute each transformer layer in the backward (activation memory)
         self.transformer_encoder = nn.Sequential(*[
             TxLayer(lay["d_model"], lay["nhead"], lay["dim_feedforward"], lay["deepnorm_alpha"],
                     lay["attn_window"], lay.get("theta", 10000.0), lay.get("max_seq_len", 4096))
@@ -148,7 +150,12 @@ class DoradoEncoder(nn.Module):
         if self.koi is not None:
             n, _, t = x.shape
             return self.koi(x.reshape(-1), [t] * n).view(n, t // self.stride, -1)
-        return self.transformer_encoder(self.conv(x).transpose(1, 2))
+        x = self.conv(x).transpose(1, 2)
+        if not (self.grad_ckpt and torch.is_grad_enabled()):
+            return self.transformer_encoder(x)
+        for layer in self.transformer_encoder:
+            x = torch.utils.checkpoint.checkpoint(layer, x, use_reentrant=False)
+        return x
 
     def forward_varlen(self, signal, lens):
         """Variable-length chunks as in Dorado's VCS path: each chunk is encoded independently

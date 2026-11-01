@@ -93,6 +93,7 @@ def main():
     encoder = load_dorado_encoder(args.model_dir).to(dev, torch.float16).eval()
     if args.encoder == "koi":
         encoder.use_koi()
+    base = {k: v.clone() for k, v in encoder.state_dict().items()}
     rows = pl.read_parquet(args.windows).to_dicts()
     wins = load_windows(rows, encoder.mean, encoder.stdev, args.ref)
     calls = {"dorado": dorado_calls(args.model_dir, encoder, wins, dev)}
@@ -100,6 +101,9 @@ def main():
     print("dorado", json.dumps(res["dorado"]), flush=True)
     for path in args.snaps:
         s = torch.load(path, map_location="cpu", weights_only=False)
+        encoder.load_state_dict(s.get("encoder", base))  # fine-tuned (train.py --train-encoder) or released weights
+        if args.encoder == "koi":
+            encoder.use_koi()  # koi copies the weights
         model = Basecaller.from_args(encoder, s["args"])
         model.projector.load_state_dict(s["projector"])
         model.decoder.load_state_dict(s["decoder"])

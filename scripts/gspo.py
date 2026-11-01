@@ -94,9 +94,13 @@ def sources(specs):
 
 
 def load_model(model_dir, init, dev):
-    encoder = load_dorado_encoder(model_dir).to(dev, torch.float16).eval().use_koi()
     s = torch.load(init, map_location="cpu", weights_only=False)
+    encoder = load_dorado_encoder(model_dir)
+    if "encoder" in s:  # fine-tuned (train.py --train-encoder); kept frozen here and saved with every checkpoint
+        encoder.load_state_dict(s["encoder"])
+    encoder = encoder.to(dev, torch.float16).eval().use_koi()
     model = Basecaller.from_args(encoder, s["args"])
+    model.tuned_encoder = s.get("encoder")
     model.set_encoder_trainable(False)
     model.projector.load_state_dict(s["projector"])
     model.decoder.load_state_dict(s["decoder"])
@@ -410,9 +414,11 @@ def train(args, dev, rank, world):
                      "opt": opt.state_dict(), "args": vars(args) | {"tokenizer": "4mer" if model.tokenizer.k == 4 else "base",
                                                           "layers": model.cfg.n_layers},
                      "wandb_id": wb.id}
+            if model.tuned_encoder is not None:
+                state["encoder"] = model.tuned_encoder
             torch.save(state, ckpt + ".tmp")
             os.replace(ckpt + ".tmp", ckpt)
-            torch.save({k: state[k] for k in ("step", "projector", "decoder", "args")},
+            torch.save({k: state[k] for k in ("step", "projector", "decoder", "args", "encoder") if k in state},
                        os.path.join(args.out, f"snap_{step:07d}.pt"))
         dist.barrier()
 

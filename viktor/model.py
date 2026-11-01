@@ -73,22 +73,29 @@ class Basecaller(nn.Module):
     def forward(self, signal, tokens_in):
         return self.logits(self.encoder(signal), tokens_in)
 
-    @torch.no_grad()
     def encode(self, sig, valid):
         """Decoder input as at inference: encoder frames [B, P, d_enc] (P = frames of a full window) and the real
-        frames per window [B]. sig [B, 1, S] from data.collate, valid: real samples per window; a short window is
-        encoded at its repeat-padded length (encoder.encode_chunks) and its frames past the real signal are zero."""
+        frames per window [B]. sig [B, 1, S] from data.collate, valid: real samples per window; full windows are
+        encoded as one batch, a short window at its repeat-padded length (encoder.encode_chunks) with its frames past
+        the real signal zero. Differentiable with the PyTorch encoder (train.py --train-encoder): inference callers
+        wrap it in no_grad."""
         S, st, g = sig.shape[-1], self.encoder.stride, self.encoder.granularity
-        if bool((valid == S).all()):
+        full = valid == S
+        if bool(full.all()):
             frames = self.encoder(sig)
             return frames, torch.full((len(valid),), frames.shape[1], device=frames.device)
-        lens = [-(-int(v) // g) * g for v in valid]
-        flat, flens = self.encoder.encode_chunks(torch.cat([sig[b, 0, :n] for b, n in enumerate(lens)]), lens,
-                                                 [int(v) for v in valid])
-        frames = flat.new_zeros(len(lens), S // st, flat.shape[-1])
-        for b, (o, n) in enumerate(zip(np.cumsum([0] + flens[:-1]), flens)):
+        short = torch.nonzero(~full)[:, 0].tolist()
+        lens = [-(-int(valid[b]) // g) * g for b in short]
+        flat, flens = self.encoder.encode_chunks(torch.cat([sig[b, 0, :n] for b, n in zip(short, lens)]), lens,
+                                                 [int(valid[b]) for b in short])
+        frames = flat.new_zeros(len(valid), S // st, flat.shape[-1])
+        plens = torch.full((len(valid),), S // st)
+        if bool(full.any()):
+            frames[full.to(frames.device)] = self.encoder(sig[full.to(sig.device)]).to(frames.dtype)
+        for b, o, n in zip(short, np.cumsum([0] + flens[:-1]), flens):
             frames[b, :n] = flat[o:o + n]
-        return frames, torch.tensor(flens, device=frames.device)
+            plens[b] = n
+        return frames, plens.to(frames.device)
 
     def batch(self, seqs, weights=None, pad_to=1, centers=None):
         """CPU tensors for teacher forcing: tokens_in, targets [B, T] and target weights [B, T], T padded up to a

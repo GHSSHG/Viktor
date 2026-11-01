@@ -15,6 +15,12 @@ resumable copy of the state just before the decay is kept as OUT/predecay_<step>
 the learning rate stays at --lr until --max-steps, so the decay can be scheduled later by resuming with
 --decay-start. --init starts a new run (own OUT, own wandb run) from another run's resumable checkpoint
 (projector, decoder, optimizer state, step).
+--train-encoder: the encoder is trained too (full fine-tuning): PyTorch layers instead of koi, fp32 weights with bf16
+autocast, each transformer layer recomputed in the backward (encoder.grad_ckpt); its own optimizer group (lr x
+--encoder-lr-mult on the same schedule, linear warmup over --encoder-warmup steps from the step it started training,
+no weight decay), its gradients averaged over ranks after the backward and clipped separately (--clip). Its weights
+go into last.pt / snap_*.pt as "encoder" (the evaluation / basecalling scripts load them). Validation and heldout
+decoding run its forward in fp16 autocast, the inference precision.
 Logged to wandb (rank 0) every --log-every steps, including each GPU's temperature / SM clock / power.
   val      every --val-every steps: teacher-forced weighted loss / base accuracy on fixed 'val' windows of every
            source (val/<part>/loss, val/<part>/acc; the first source also as val/loss, val/acc)
@@ -184,7 +190,8 @@ def eval_val(model, val, batch, dev, prefix="val"):
     for i in range(0, len(val), batch):
         g = val[i:i + batch]
         sig, valid, seqs, ws = collate(g)
-        frames, plens = model.encode(sig.to(dev), valid)
+        with torch.autocast("cuda", dtype=torch.float16):  # a trained (fp32) encoder at the inference precision
+            frames, plens = model.encode(sig.to(dev), valid)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             l, _, _, c, s = model.frame_loss(frames, seqs, ws, plens)
         loss, correct, scored = loss + float(l) * len(g), correct + float(c), scored + float(s)
@@ -205,7 +212,8 @@ def heldout_calls(model, heldout, batch, dev):
         g = heldout[i:i + batch]
         g = g + [g[-1]] * (batch - len(g))
         sig, valid = collate(g)[:2]
-        frames, plens = model.encode(sig.to(dev), valid)
+        with torch.autocast("cuda", dtype=torch.float16):
+            frames, plens = model.encode(sig.to(dev), valid)
         plens = plens.tolist()
         toks = eng.generate(torch.cat([f[:n] for f, n in zip(frames, plens)]), plens).cpu()
         preds += [model.tokenizer.decode(t) for t in toks]
@@ -232,6 +240,9 @@ def main():
     ap.add_argument("--decay-start", type=int, default=None, help="WSD: decay from this step (instead of --decay-frac)")
     ap.add_argument("--decay-steps", type=int, default=250_000, help="WSD with --decay-start: decay length")
     ap.add_argument("--weight-decay", type=float, default=0.1)
+    ap.add_argument("--train-encoder", action="store_true", help="fine-tune the encoder too (PyTorch layers, not koi)")
+    ap.add_argument("--encoder-lr-mult", type=float, default=0.1, help="--train-encoder: encoder lr / decoder lr")
+    ap.add_argument("--encoder-warmup", type=int, default=2000, help="--train-encoder: encoder lr warmup steps")
     ap.add_argument("--clip", type=float, default=1.0)
     ap.add_argument("--pad-to", type=int, default=128, help="pad label lengths to a multiple (compile shapes)")
     ap.add_argument("--tokenizer", choices=["base", "4mer"], default="base", help="decoder output unit")
@@ -278,9 +289,13 @@ def main():
         total = decay_start = args.max_steps
     stop = min(total, args.max_steps or total)
 
-    encoder = load_dorado_encoder(args.model_dir).to(dev, torch.float16).eval().use_koi()
+    encoder = load_dorado_encoder(args.model_dir).to(dev)
+    if args.train_encoder:
+        encoder.grad_ckpt = True
+    else:
+        encoder.to(torch.float16).eval().use_koi()
     model = Basecaller.from_args(encoder, vars(args))
-    model.set_encoder_trainable(False)
+    model.set_encoder_trainable(args.train_encoder)
     if args.align_weight > 0:
         model.align = AlignConfig(tuple(int(x) for x in args.align_layers.split(",")),
                                   tuple(int(x) for x in args.align_heads.split(",")), args.align_sigma, args.align_weight)
@@ -291,16 +306,25 @@ def main():
     no_decay = [p for n, p in trainable.named_parameters() if not (p.ndim == 2 and "embed" not in n)]
     opt = torch.optim.AdamW([{"params": decay, "weight_decay": args.weight_decay},
                              {"params": no_decay, "weight_decay": 0.0}], lr=args.lr, betas=(0.9, 0.95), fused=True)
-    step, run_id = 0, None
+    enc_group = {"params": list(encoder.parameters()), "weight_decay": 0.0}
+    step, run_id, enc_start = 0, None, 0
     ckpt = os.path.join(args.out, "last.pt")
     start = ckpt if os.path.exists(ckpt) else args.init
     if start:
         s = torch.load(start, map_location=dev, weights_only=False)
         model.projector.load_state_dict(s["projector"])
         model.decoder.load_state_dict(s["decoder"])
-        opt.load_state_dict(s["opt"])
         step = s["step"]
+        if "encoder" in s:
+            assert args.train_encoder, "a fine-tuned encoder: continue with --train-encoder"
+            encoder.load_state_dict(s["encoder"])
+        enc_start = s.get("enc_start", step)
+        if args.train_encoder and len(s["opt"]["param_groups"]) == 3:  # the encoder group was saved too
+            opt.add_param_group(enc_group)
+        opt.load_state_dict(s["opt"])
         run_id = s.get("wandb_id") if start == ckpt else None
+    if args.train_encoder and len(opt.param_groups) == 2:  # its moments start at zero, hence its own warmup
+        opt.add_param_group(enc_group)
     ddp = nn.parallel.DistributedDataParallel(trainable, device_ids=[dev.index])
     step_fn = ddp if args.no_compile else torch.compile(ddp, dynamic=False)  # one graph per --pad-to length
 
@@ -326,7 +350,7 @@ def main():
         heldout = fixed_windows(sources[0][0], "heldout", args.eval_n, encoder.mean, encoder.stdev, sources[0][1])
         base = os.path.join(args.out, "dorado.json")
         if not os.path.exists(base):
-            with open(base, "w") as f:
+            with open(base, "w") as f, torch.autocast("cuda", dtype=torch.float16):
                 json.dump(identity_stats(dorado_calls(args.model_dir, encoder, heldout, dev), heldout), f)
         with open(base) as f:
             wb.summary.update({f"dorado/{k}": v for k, v in json.load(f).items()})
@@ -335,9 +359,11 @@ def main():
     def save():
         state = {"step": step, "projector": model.projector.state_dict(), "decoder": model.decoder.state_dict(),
                  "opt": opt.state_dict(), "args": vars(args), "wandb_id": run_id}
+        if args.train_encoder:
+            state |= {"encoder": encoder.state_dict(), "enc_start": enc_start}
         torch.save(state, ckpt + ".tmp")
         os.replace(ckpt + ".tmp", ckpt)
-        torch.save({k: state[k] for k in ("step", "projector", "decoder", "args")},
+        torch.save({k: state[k] for k in ("step", "projector", "decoder", "args", "encoder") if k in state},
                    os.path.join(args.out, f"snap_{step:07d}.pt"))
 
     t0, paused, acc = time.time(), 0.0, torch.zeros(6, device=dev)  # loss, ce, align sums, correct, scored, bases
@@ -348,16 +374,26 @@ def main():
             save()
             shutil.copyfile(ckpt, os.path.join(args.out, f"predecay_{step}.pt"))
         lr = wsd(step, total, args.lr, args.warmup, args.decay_frac, decay_start)
-        for g in opt.param_groups:
+        for g in opt.param_groups[:2]:
             g["lr"] = lr
+        if args.train_encoder:
+            opt.param_groups[2]["lr"] = lr * args.encoder_lr_mult * min(1.0, (step - enc_start + 1) / args.encoder_warmup)
         tokens_in, targets, w, centers = (t.to(dev, non_blocking=True) for t in model.batch(seqs, ws, args.pad_to, cs))
-        with torch.no_grad():
+        with torch.autocast("cuda", dtype=torch.bfloat16), torch.set_grad_enabled(args.train_encoder):
             frames, plens = model.encode(sig.to(dev, non_blocking=True), valid)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             loss, ce, align, correct, scored = step_fn(frames, tokens_in, targets, w, centers, plens)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         gnorm = nn.utils.clip_grad_norm_(trainable.parameters(), args.clip)
+        if args.train_encoder:  # outside DDP (encode runs it once per short window): average its gradients here
+            ps = enc_group["params"]
+            flat = torch.cat([(p.grad if p.grad is not None else torch.zeros_like(p)).flatten() for p in ps])
+            dist.all_reduce(flat)
+            flat /= world
+            for p, gp in zip(ps, flat.split([p.numel() for p in ps])):
+                p.grad = gp.view_as(p)
+            enc_gnorm = nn.utils.clip_grad_norm_(ps, args.clip)
         opt.step()
         step += 1
         acc += torch.stack([loss.detach(), ce.detach(), align.detach(), correct.float(), scored.float(),
@@ -373,6 +409,8 @@ def main():
                        "train/align": float(acc[2]) / (n * world), "train/acc": float(acc[3] / acc[4]), "lr": lr,
                        "grad_norm": float(gnorm), "s_per_step": dt / n, "bases_per_s": float(acc[5]) / dt,
                        "paused_s": paused, "mem_gib": torch.cuda.max_memory_allocated() / 2**30}
+                if args.train_encoder:
+                    rec |= {"encoder_grad_norm": float(enc_gnorm), "encoder_lr": opt.param_groups[2]["lr"]}
                 for i, (temp, clock, power) in enumerate(gpu_stats()):
                     rec |= {f"gpu{i}/temp": temp, f"gpu{i}/sm_mhz": clock, f"gpu{i}/power_w": power}
                 wb.log(rec, step=step)
