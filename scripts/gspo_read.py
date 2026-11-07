@@ -59,7 +59,7 @@ from viktor.data import (CRF_FRAME, DNA_TRIM_START, SIZE, STRIDE, collate, index
 POSITIONS = ("first", "middle", "last")
 HUMAN = ("part1", "part2", "part3")
 COLS = ["read_id", "parent_id", "pod5", "split_start", "num_samples", "win", "win_len", "contig", "strand", "g_lo",
-        "g_hi", "mask_lo", "mask_hi", "seg_off", "seg_n", "f_first", "f_exit", "ad_i0", "ad_i1", "label", "lw"]
+        "g_hi", "mask_lo", "mask_hi", "seg_off", "seg_n", "f_first", "f_exit", "ad_i0", "ad_i1", "label", "lw", "split", "w"]
 _COMP = str.maketrans("ACGTN", "TGCAN")
 
 
