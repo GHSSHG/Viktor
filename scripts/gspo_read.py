@@ -228,6 +228,8 @@ def _prep_file(job):
         k = rng.choice(pick)
         ks = list(range(max(k - 1, 0), min(k + 1, last) + 1))
         a0 = spans[ks[0]][0]
+        if np.searchsorted(mid, spans[k][1]) - np.searchsorted(mid, spans[k][0]) < P["min_bases"]:
+            continue  # chunk k carries almost no labelled bases (stall / segment gap): nothing to learn
         # truth: segment bases with midpoints in chunk k +- pad, +- ref_margin bases of reference (read order)
         i0 = int(np.searchsorted(mid, spans[k][0] - P["pad"])) - P["ref_margin"]
         i1 = int(np.searchsorted(mid, spans[k][1] + P["pad"])) + P["ref_margin"]
@@ -291,7 +293,8 @@ def prep(args):
         if os.path.exists(p):
             exclude |= {l.strip() for l in open(p) if l.strip()}
     P = {"mean": enc.mean, "stdev": enc.stdev, "overlap": enc.overlap, "edge_share": args.edge_share,
-         "edge_slack": args.edge_slack, "pad": args.pad, "ref_margin": args.ref_margin, "seed": args.seed}
+         "edge_slack": args.edge_slack, "pad": args.pad, "ref_margin": args.ref_margin, "seed": args.seed,
+         "min_bases": args.min_bases}
     t = time.time()
     for split, n_reads in (("train", args.reads), ("val", args.eval_reads)):
         if os.path.exists(os.path.join(out, f"{split}.pt")):
@@ -615,6 +618,7 @@ def main():
     ap.add_argument("--pad", type=int, default=6000, help="prep: truth = bases within chunk k +- this many samples "
                                                           "(> --margin bases of signal)")
     ap.add_argument("--ref-margin", type=int, default=50, help="prep: ... + this many reference bases on both sides")
+    ap.add_argument("--min-bases", type=int, default=200, help="prep: skip entries whose chunk k holds fewer labelled bases")
     ap.add_argument("--procs", type=int, default=16, help="prep: loader processes")
     ap.add_argument("--pool", help="train: directory holding readpool/ (default --out)")
     ap.add_argument("--eval", nargs="+", default=[f"{bd}/viktor_win12288_bact:bact:val", f"{bd}/viktor_win12288_hall:hall:val"],
