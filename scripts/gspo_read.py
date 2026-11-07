@@ -4,13 +4,14 @@ A training entry is one chunk k of a read (Dorado chunking as basecall_viktor: 1
 last chunk anchored to the read end) together with its neighbours k-1 and k+1. Every step the neighbours are decoded
 greedily with the current policy (shared by the group), --group candidates of chunk k are sampled, and each candidate
 is stitched with its neighbours exactly as at inference (homopolymer cap, overlap_cut at the overlap middle; adapter
-trim on a read's first chunk). The aligned sequence is chunk k's kept span plus --margin bases of each neighbour beyond
-the cuts; only the errors of chunk k's own part count (its substitutions / insertions, deletions inside it or at its
-seams), so duplicated / dropped seam bases, a derailed or truncated chunk end and clipped read ends cost reward while
-the neighbours only anchor the alignment. Truth: the reference bases of the read's stage-6 segment whose signal
-midpoints lie within chunk k's span +- --pad samples, extended by --ref-margin bases of the reference on both sides;
-edlib HW (every base must align, the truth ends are free). Reward = 1 - own errors / max(own length, truth bases
-aligned to it); errors on masked label bases (index mask_lo / mask_hi, N) do not count.
+trim on a read's first chunk). Only chunk k's own stitched part is scored: the first ANCHOR bases of the right
+neighbour and the last ANCHOR bases of the left neighbour beyond the cuts are placed in the truth (edlib HW), which
+fixes the truth span of the own part, and the own part is aligned end to end into that span; so duplicated / dropped
+seam bases, a derailed, truncated or empty chunk all cost reward, while the neighbours' errors do not (a side without
+a neighbour, e.g. the read ends, is free in the truth). Truth: the reference bases of the read's stage-6 segment whose
+signal midpoints lie within chunk k's span +- --pad samples, extended by --ref-margin bases of the reference on both
+sides. Reward = 1 - errors / max(own length, truth span); errors on masked label bases (index mask_lo / mask_hi, N)
+do not count.
 
 prep   (one process, CPU) --reads train-split reads and --eval-reads val-split reads of the --sources (weights: share of
        the reads; default human : bacteria = 4 : 1, split within each as runs/k4.sh) with one stage-6 segment, at least
@@ -64,6 +65,7 @@ HUMAN = ("part1", "part2", "part3")
 COLS = ["read_id", "parent_id", "pod5", "split_start", "num_samples", "win", "win_len", "contig", "strand", "g_lo",
         "g_hi", "mask_lo", "mask_hi", "seg_off", "seg_n", "f_first", "f_exit", "ad_i0", "ad_i1", "label", "lw", "split", "w"]
 _COMP = str.maketrans("ACGTN", "TGCAN")
+ANCHOR = 150  # neighbour bases used to place the own part in the truth
 
 
 # ---------------------------------------------------------------------------------------------------------- reward
@@ -85,41 +87,63 @@ def local_sequence(calls, spans, t, margin):
     return left, s[start:end], right
 
 
-def read_reward(seq, truth, w, lo=0, hi=None):
-    """1 - errors / n over the own part seq[lo:hi]: seq is aligned into truth (HW: all of seq, truth ends free) and only
-    errors of the own part count (substitutions and insertions of its bases, deletions between them or at its two
-    seams); errors at truth bases of weight 0 (an insertion: at the truth base before it) do not count; n = max(own
-    length, truth bases aligned to it). The neighbour bases around it only anchor the alignment: their errors, and their
-    overhang past the truth ends, cost nothing (the same for every candidate of a group)."""
-    hi = len(seq) if hi is None else hi
-    if not seq:
-        return 0.0
-    r = edlib.align(seq, truth, mode="HW", task="path")
+def flank_anchor(flank, truth, left, n=ANCHOR):
+    """Truth position where the own part starts (left neighbour: end of its last n bases in truth) or ends (right
+    neighbour: start of its first n bases); None when the flank is short or does not align (> 25% edits)."""
+    part = flank[-n:] if left else flank[:n]
+    if len(part) < n // 4:
+        return None
+    r = edlib.align(part, truth, mode="HW", task="locations")
+    if r["editDistance"] < 0 or r["editDistance"] > 0.25 * len(part):
+        return None
+    lo, hi = r["locations"][0]
+    return hi + 1 if left else lo
+
+
+def weighted_errors(q, t, w, mode):
+    """Weighted edit operations of q aligned to t (edlib mode), errors at truth bases of weight 0 (an insertion: at the
+    truth base before it) not counted -> (errors, truth bases consumed)."""
+    if not t:
+        return float(len(q)), 0
+    if not q:
+        return (float(w.sum()), len(t)) if mode == "NW" else (0.0, 0)
+    r = edlib.align(q, t, mode=mode, task="path")
     ti = t0 = r["locations"][0][0]
-    q, err, own_t, num = 0, 0.0, 0, ""
+    err, num = 0.0, ""
     for ch in r["cigar"]:
         if ch.isdigit():
             num += ch
             continue
         n, num = int(num), ""
-        if ch == "D":
-            if lo <= q <= hi:
-                err += float(w[ti:ti + n].sum())
-                own_t += n
+        if ch in "XD":
+            err += float(w[ti:ti + n].sum())
             ti += n
-            continue
-        a, b = max(q, lo), min(q + n, hi)  # own part of this query run
-        if a < b:
-            if ch == "I":
-                err += (b - a) * float(w[max(ti - 1, t0)])
-            else:
-                own_t += b - a
-                if ch == "X":
-                    err += float(w[ti + a - q:ti + b - q].sum())
-        q += n
-        if ch != "I":
+        elif ch == "I":
+            err += n * float(w[max(ti - 1, t0)])
+        else:
             ti += n
-    return max(0.0, 1 - err / max(hi - lo, own_t, 1))
+    return err, ti - t0
+
+
+def read_reward(own, truth, w, left="", right=""):
+    """1 - errors / max(len(own), truth bases of the own part): the own part's truth span is fixed by the neighbours
+    (flank_anchor of the left / right flank) and own is aligned end to end into it, so dropped, truncated or duplicated
+    bases all count; a side without an anchor (read end, empty or unaligned neighbour) is free in the truth. The
+    neighbours' own errors cost nothing (the same for every candidate of a group)."""
+    a = flank_anchor(left, truth, True) if left else None
+    b = flank_anchor(right, truth, False) if right else None
+    if a is not None and b is not None:
+        b = max(a, b)
+        err, n_t = weighted_errors(own, truth[a:b], w[a:b], "NW")
+    elif b is not None:  # free start: reversed, prefix mode (free end of the target)
+        err, n_t = weighted_errors(own[::-1], truth[:b][::-1], w[:b][::-1], "SHW")
+    elif a is not None:
+        err, n_t = weighted_errors(own, truth[a:], w[a:], "SHW")
+    else:
+        err, n_t = weighted_errors(own, truth, w, "HW")
+    if not own and (a is None or b is None):
+        return 0.0
+    return max(0.0, 1 - err / max(len(own), n_t, 1))
 
 
 def entry_reward(calls, e, margin, cap):
@@ -127,13 +151,9 @@ def entry_reward(calls, e, margin, cap):
     if cap:
         calls = [cap_homopolymers(c, cap) for c in calls]
     left, kept, right = local_sequence(calls, e["spans"], e["t"], margin)
-    seq = left + kept + right
-    lo = len(left)
     if e["pos"] == "first":
-        trimmed = trim_adapter(seq)
-        lo = max(lo - (len(seq) - len(trimmed)), 0)
-        seq = trimmed
-    return read_reward(seq, e["truth"], e["tw"], lo, max(len(seq) - len(right), lo))
+        kept = trim_adapter(kept)
+    return read_reward(kept, e["truth"], e["tw"], left, right)
 
 
 def group_rewards(task):
