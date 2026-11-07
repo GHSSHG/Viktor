@@ -202,11 +202,12 @@ class WindowDataset(torch.utils.data.IterableDataset):
     reshuffled every pass."""
 
     def __init__(self, index_dir, split, mean, stdev, rank=0, world=1, seed=0, ref=REF, stage6=STAGE6,
-                 segments=SEGMENTS, reads_per_load=32, buffer=4096):
+                 segments=SEGMENTS, reads_per_load=32, buffer=4096, exclude=None):
         self.files, self.split, self.ref, self.stage6 = index_files(index_dir), split, ref, stage6
         self.segments = segments
         self.mean, self.stdev, self.rank, self.world, self.seed = mean, stdev, rank, world, seed
         self.reads_per_load, self.buffer = reads_per_load, buffer
+        self.exclude = exclude  # dir of <index file>.npy: sorted rows of the index file (before the split filter) never to yield
 
     def __iter__(self):
         wi = torch.utils.data.get_worker_info()
@@ -215,12 +216,20 @@ class WindowDataset(torch.utils.data.IterableDataset):
         mine = [f for i, f in enumerate(self.files) if i % G == gid] or [self.files[gid % len(self.files)]]
         rng = random.Random(self.seed * 100003 + gid)
         fa = pysam.FastaFile(self.ref)
-        buf = []
+        buf, widen = [], 1
         while True:
+            got = False
             for path in rng.sample(mine, len(mine)):
-                idx = split_rows(pl.read_parquet(path), self.split)
+                df = pl.read_parquet(path)
+                skip = os.path.join(self.exclude, os.path.basename(path)[:-len(".parquet")] + ".npy") if self.exclude else None
+                if skip and os.path.exists(skip):
+                    keep = np.ones(df.height, bool)
+                    keep[np.load(skip)] = False
+                    df = df.filter(pl.Series(keep))
+                idx = split_rows(df, self.split)
                 if idx.height == 0:
                     continue
+                got = True
                 # rows stay columnar; only the reads being loaded become dicts (a whole file of dicts took GBs per worker)
                 groups = (idx.with_row_index("_i").group_by("read_id", maintain_order=True)
                           .agg("_i")["_i"].to_list())  # row indices per read, in first-appearance order
@@ -249,6 +258,9 @@ class WindowDataset(torch.utils.data.IterableDataset):
                             buf.append((x, seq, base_weights(r, seq), centers))
                         while len(buf) >= self.buffer:
                             yield buf.pop(rng.randrange(len(buf)))
+            if not got and self.exclude:  # every window of this worker's files is excluded: also draw from the next worker's files
+                mine = mine + [f for i, f in enumerate(self.files) if i % G == (gid + widen) % G]
+                widen += 1
 
 
 class MixedDataset(torch.utils.data.IterableDataset):

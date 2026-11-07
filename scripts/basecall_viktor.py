@@ -11,6 +11,7 @@ Example:
 """
 
 import argparse
+import re
 import time
 
 import edlib
@@ -20,6 +21,7 @@ import torch
 
 from scripts.basecall_crf import STRIDE
 from viktor import Basecaller, DecodeEngine, load_dorado_encoder
+from scripts.make_head_labels import ADAPTER
 from viktor.chunking import chunk_read, repeat_pad, scale_record
 
 
@@ -48,6 +50,19 @@ def overlap_cut(a, b, ov_frames, rate):
             ia += op in "=XI"  # edlib: I = extra base in the query (q, from a), D = extra base in the target (b)
             ib += op in "=XD"
     return p + half, ib
+
+
+def trim_adapter(seq, max_ed=8, head=120):
+    """Cut the ligation adapter (and anything before it) off the read start, as dorado basecaller does by default; the
+    model is trained to call it (make_head_labels.ADAPTER). No clean match: the read is left as called."""
+    r = edlib.align(ADAPTER, seq[:head], mode="HW", task="locations", k=max_ed)
+    return seq[r["locations"][0][1] + 1:] if r["editDistance"] >= 0 else seq
+
+
+def cap_homopolymers(seq, max_run, keep=20):
+    """A decoder that never emits EOS on a flat signal fills the chunk with one base (up to the generation cap); shorten
+    every run of >= max_run identical bases to keep. Runs this long are not real DNA (and they are all there is to the junk)."""
+    return re.sub(rf"(.)\1{{{max_run - 1},}}", lambda m: m.group(1) * keep, seq)
 
 
 def _cigar(c):
@@ -88,6 +103,11 @@ def main():
     ap.add_argument("--anchor-tail", action=argparse.BooleanOptionalAction, default=True,
                     help="reads >= one chunk: replace the short last chunk by a full chunk ending at the read end "
                          "(the decoder was only trained on full-length windows)")
+    ap.add_argument("--trim-adapter", action=argparse.BooleanOptionalAction, default=True,
+                    help="cut the ligation adapter off the read start (dorado does by default)")
+    ap.add_argument("--homopolymer-cap", type=int, default=60, metavar="N",
+                    help="shorten runs of >= N identical bases in every chunk call to 20 before stitching (0: off)")
+    ap.add_argument("--timing", help="write one TSV row per decoded batch: size, encode s, decode s, call lengths")
     ap.add_argument("--dump-chunks", help="also write every chunk call (before stitching) to this FASTA")
     args = ap.parse_args()
 
@@ -124,18 +144,29 @@ def main():
     items.sort(key=lambda it: -len(it[4]))
     print(f"{len(reads)} reads, {len(items)} chunks", flush=True)
 
-    calls, t0 = {}, time.time()
+    calls, t0, tim = {}, time.time(), []
     with torch.no_grad():
         for i in range(0, len(items), args.batch):
             g = items[i:i + args.batch]
             n = len(g)
             g = g + [g[-1]] * (args.batch - n)
             sig = torch.from_numpy(np.concatenate([it[4] for it in g])).to(dev, torch.float16)
+            t1 = time.time()
             frames, flens = enc.encode_chunks(sig, [len(it[4]) for it in g], [it[3] - it[2] for it in g])
+            torch.cuda.synchronize()
+            t2 = time.time()
             toks = engine.generate(frames, flens).cpu()
+            t3 = time.time()
             for it, t in zip(g[:n], toks):
                 calls[(it[0], it[1])] = model.tokenizer.decode(t)
+                if args.homopolymer_cap:
+                    calls[(it[0], it[1])] = cap_homopolymers(calls[(it[0], it[1])], args.homopolymer_cap)
+            tim.append((n, t2 - t1, t3 - t2, [len(calls[(it[0], it[1])]) for it in g[:n]]))
     print(f"decoded in {time.time() - t0:.0f} s", flush=True)
+    if args.timing:
+        with open(args.timing, "w") as f:
+            for n, te, td, lens in tim:
+                f.write(f"{n}\t{te:.4f}\t{td:.4f}\t{','.join(map(str, lens))}\n")
 
     if args.dump_chunks:
         with open(args.dump_chunks, "w") as f:
@@ -145,6 +176,8 @@ def main():
     with open(args.out, "w") as f:
         for rid, (n, spans) in reads.items():
             seq = stitch([calls[(rid, c)] for c in range(len(spans))], spans, n, overlap)
+            if args.trim_adapter:
+                seq = trim_adapter(seq)
             if seq:
                 f.write(f">{rid}\n{seq}\n")
 

@@ -7,13 +7,16 @@ A parquet with a 'stratum' column (and 'pop', the stratum's window count in the 
 scored per stratum, plus 'natural': the strata with labels averaged by pop. Windows labelled "" (no DNA) are scored
 as the fraction called with at most EMPTY_MAX bases and the mean call length.
 
+Every visible GPU takes a share of the windows (CUDA_VISIBLE_DEVICES; default all).
+
 Example:
-  CUDA_VISIBLE_DEVICES=3 python -m scripts.evaluate --model-dir MODEL --windows ~/Work/BasecallerData/viktor_ef22_n1024.parquet \
+  python -m scripts.evaluate --model-dir MODEL --windows ~/Work/BasecallerData/viktor_ef22_n1024.parquet \
       --ref /data_nvme/bacteria_ef22/reference/ef22_ref.fasta --out runs/eval_ef22.json runs/sft2/snap_0020000.pt runs/sft2/snap_0030000.pt
 """
 
 import argparse
 import json
+import multiprocessing as mp
 
 import edlib
 import numpy as np
@@ -28,8 +31,9 @@ EMPTY_MAX = 4
 TRIM = 24  # label bases Dorado's stitching drops at each side of a 600-sample chunk overlap
 
 
-def strict(pred, ref, row):
-    """(identity, trimmed identity or None when no label base is left)."""
+def strict(pred, ref, row, query=False):
+    """(identity, trimmed identity or None when no label base is left). query: errors / call length (the read-level
+    formula 1 - (NM + clipped) / query length, floored at 0) instead of / max(call length, label length)."""
     lo = 0 if row.get("win") == 0 else TRIM
     hi = len(ref) if (row.get("hard") or 0) & 24 else len(ref) - TRIM
     cig = edlib.align(pred, ref, mode="NW", task="path")["cigar"] or f"{len(ref)}D"
@@ -50,20 +54,22 @@ def strict(pred, ref, row):
         if ch != "D":
             q_mid += mid
         ri += n
+    if query:
+        return max(0.0, 1 - ed / max(len(pred), 1)), (max(0.0, 1 - ed_mid / max(q_mid, 1)) if hi > lo else None)
     return 1 - ed / max(len(pred), len(ref)), (1 - ed_mid / max(q_mid, hi - lo) if hi > lo else None)
 
 
-def identity_stats(preds, wins, rows):
-    ident, trim = zip(*(strict(p, s, r) for p, (_, s, _), r in zip(preds, wins, rows)))
+def identity_stats(preds, wins, rows, query=False):
+    ident, trim = zip(*(strict(p, s, r, query) for p, (_, s, _), r in zip(preds, wins, rows)))
     ident, trim = np.array(ident), np.array([t for t in trim if t is not None])
     st = lambda a: {"mean": float(a.mean()), "median": float(np.median(a)), "derail": float((a < 0.9).mean())}
     return ({f"identity_{k}": v for k, v in st(ident).items()} | {f"trim_{k}": v for k, v in st(trim).items()}
             | {"n_trim": len(trim)})
 
 
-def scores(preds, wins, rows):
+def scores(preds, wins, rows, query=False):
     if "stratum" not in rows[0]:
-        return identity_stats(preds, wins, rows)
+        return identity_stats(preds, wins, rows, query)
     out, nat = {}, {}
     for st in dict.fromkeys(r["stratum"] for r in rows):
         ids = [i for i, r in enumerate(rows) if r["stratum"] == st]
@@ -71,11 +77,39 @@ def scores(preds, wins, rows):
             n = np.array([len(preds[i]) for i in ids])
             out[st] = {"n": len(ids), "empty_ok": float((n <= EMPTY_MAX).mean()), "call_len_mean": float(n.mean())}
         else:
-            out[st] = {"n": len(ids)} | identity_stats(*([a[i] for i in ids] for a in (preds, wins, rows)))
+            out[st] = {"n": len(ids)} | identity_stats(*([a[i] for i in ids] for a in (preds, wins, rows)), query)
             nat[st] = rows[ids[0]]["pop"]
     tot = sum(nat.values())
     out["natural"] = {k: sum(out[st][k] * n for st, n in nat.items()) / tot for k in ("identity_mean", "identity_derail", "trim_mean", "trim_derail")}
     return out
+
+
+def shard_calls(job):
+    """One GPU's share (windows i = shard, shard + n_shards, ...): {"dorado" | snap path: [calls]}, and the step of each snap."""
+    shard, n_shards, args = job
+    dev = torch.device("cuda", shard)
+    torch.cuda.set_device(dev)
+    encoder = load_dorado_encoder(args.model_dir).to(dev, torch.float16).eval()
+    if args.encoder == "koi":
+        encoder.use_koi()
+    base = {k: v.clone() for k, v in encoder.state_dict().items()}
+    rows = pl.read_parquet(args.windows).to_dicts()[shard::n_shards]
+    wins = load_windows(rows, encoder.mean, encoder.stdev, args.ref)
+    calls, steps = {"dorado": dorado_calls(args.model_dir, encoder, wins, dev)}, {}
+    for path in args.snaps:
+        s = torch.load(path, map_location="cpu", weights_only=False)
+        encoder.load_state_dict(s.get("encoder", base))  # fine-tuned (train.py --train-encoder) or released weights
+        if args.encoder == "koi":
+            encoder.use_koi()  # koi copies the weights
+        model = Basecaller.from_args(encoder, s["args"])
+        model.projector.load_state_dict(s["projector"])
+        model.decoder.load_state_dict(s["decoder"])
+        model.projector.to(dev)
+        model.decoder.to(dev)
+        calls[path], steps[path] = heldout_calls(model, wins, args.batch, dev), s["step"]
+        del model
+        torch.cuda.empty_cache()
+    return shard, calls, steps
 
 
 def main():
@@ -87,34 +121,28 @@ def main():
     ap.add_argument("--batch", type=int, default=256)
     ap.add_argument("--encoder", choices=["koi", "torch"], default="koi", help="encoder kernels (torch: the PyTorch layers, fp16)")
     ap.add_argument("--out", required=True, help="results JSON")
+    ap.add_argument("--query-identity", action="store_true", help="score errors / call length (read-level formula)")
     args = ap.parse_args()
 
-    dev = torch.device("cuda")
-    encoder = load_dorado_encoder(args.model_dir).to(dev, torch.float16).eval()
-    if args.encoder == "koi":
-        encoder.use_koi()
-    base = {k: v.clone() for k, v in encoder.state_dict().items()}
+    # the windows are split over every visible GPU (CUDA_VISIBLE_DEVICES), one process each; the calls are scored here
+    n = torch.cuda.device_count()
+    with mp.get_context("spawn").Pool(n) as pool:
+        parts = pool.map(shard_calls, [(i, n, args) for i in range(n)])
+    encoder = load_dorado_encoder(args.model_dir)
     rows = pl.read_parquet(args.windows).to_dicts()
     wins = load_windows(rows, encoder.mean, encoder.stdev, args.ref)
-    calls = {"dorado": dorado_calls(args.model_dir, encoder, wins, dev)}
-    res = {"windows": args.windows, "n": len(wins), "dorado": scores(calls["dorado"], wins, rows)}
+    calls, steps = {}, {}
+    for key in ["dorado", *args.snaps]:
+        calls[key] = [None] * len(rows)
+        for shard, c, st in parts:
+            calls[key][shard::n] = c[key]
+            steps |= st
+    res = {"windows": args.windows, "n": len(wins), "dorado": scores(calls["dorado"], wins, rows, args.query_identity)}
     print("dorado", json.dumps(res["dorado"]), flush=True)
     for path in args.snaps:
-        s = torch.load(path, map_location="cpu", weights_only=False)
-        encoder.load_state_dict(s.get("encoder", base))  # fine-tuned (train.py --train-encoder) or released weights
-        if args.encoder == "koi":
-            encoder.use_koi()  # koi copies the weights
-        model = Basecaller.from_args(encoder, s["args"])
-        model.projector.load_state_dict(s["projector"])
-        model.decoder.load_state_dict(s["decoder"])
-        model.projector.to(dev)
-        model.decoder.to(dev)
-        calls[path] = heldout_calls(model, wins, args.batch, dev)
-        r = scores(calls[path], wins, rows)
-        res[f"{path} (step {s['step']})"] = r
-        print(path, s["step"], json.dumps(r), flush=True)
-        del model
-        torch.cuda.empty_cache()
+        r = scores(calls[path], wins, rows, args.query_identity)
+        res[f"{path} (step {steps[path]})"] = r
+        print(path, steps[path], json.dumps(r), flush=True)
     with open(args.out, "w") as f:
         json.dump(res, f, indent=1)
     pl.DataFrame(calls).write_parquet(args.out.removesuffix(".json") + "_calls.parquet")

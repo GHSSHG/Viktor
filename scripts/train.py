@@ -21,6 +21,7 @@ autocast, each transformer layer recomputed in the backward (encoder.grad_ckpt);
 no weight decay), its gradients averaged over ranks after the backward and clipped separately (--clip). Its weights
 go into last.pt / snap_*.pt as "encoder" (the evaluation / basecalling scripts load them). Validation and heldout
 decoding run its forward in fp16 autocast, the inference precision.
+Validation and heldout evaluation are sharded over all ranks (each takes windows[rank::world]), not run on rank 0 alone.
 Logged to wandb (rank 0) every --log-every steps, including each GPU's temperature / SM clock / power.
   val      every --val-every steps: teacher-forced weighted loss / base accuracy on fixed 'val' windows of every
            source (val/<part>/loss, val/<part>/acc; the first source also as val/loss, val/acc)
@@ -41,6 +42,7 @@ Examples:
 
 import argparse
 import copy
+import datetime
 import json
 import math
 import os
@@ -185,10 +187,12 @@ def dorado_calls(model_dir, encoder, wins, dev):
 
 @torch.no_grad()
 def eval_val(model, val, batch, dev, prefix="val"):
+    """Every rank scores its share of the windows (val[rank::world]); the sums are all-reduced."""
     model.eval()
+    mine = val[dist.get_rank()::dist.get_world_size()]
     loss = correct = scored = 0.0
-    for i in range(0, len(val), batch):
-        g = val[i:i + batch]
+    for i in range(0, len(mine), batch):
+        g = mine[i:i + batch]
         sig, valid, seqs, ws = collate(g)
         with torch.autocast("cuda", dtype=torch.float16):  # a trained (fp32) encoder at the inference precision
             frames, plens = model.encode(sig.to(dev), valid)
@@ -196,7 +200,9 @@ def eval_val(model, val, batch, dev, prefix="val"):
             l, _, _, c, s = model.frame_loss(frames, seqs, ws, plens)
         loss, correct, scored = loss + float(l) * len(g), correct + float(c), scored + float(s)
     model.train()
-    return {f"{prefix}/loss": loss / len(val), f"{prefix}/acc": correct / scored}
+    tot = torch.tensor([loss, correct, scored], device=dev, dtype=torch.float64)
+    dist.all_reduce(tot)
+    return {f"{prefix}/loss": float(tot[0]) / len(val), f"{prefix}/acc": float(tot[1] / tot[2])}
 
 
 @torch.no_grad()
@@ -222,8 +228,20 @@ def heldout_calls(model, heldout, batch, dev):
     return preds[:len(heldout)]
 
 
+def sharded_calls(calls_fn, wins):
+    """calls_fn on this rank's share of wins (wins[rank::world]), gathered back in order on every rank."""
+    r, n = dist.get_rank(), dist.get_world_size()
+    parts = [None] * n
+    dist.all_gather_object(parts, calls_fn(wins[r::n]))
+    out = [None] * len(wins)
+    for i in range(n):
+        out[i::n] = parts[i]
+    return out
+
+
 def eval_heldout(model, heldout, batch, dev):
-    return {f"heldout/{k}": v for k, v in identity_stats(heldout_calls(model, heldout, batch, dev), heldout).items()}
+    calls = sharded_calls(lambda w: heldout_calls(model, w, batch, dev) if w else [], heldout)
+    return {f"heldout/{k}": v for k, v in identity_stats(calls, heldout).items()}
 
 
 def main():
@@ -264,11 +282,12 @@ def main():
     ap.add_argument("--temp-resume", type=float, default=72)
     ap.add_argument("--wandb-project", default="viktor")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--exclude-used", help="dir of scripts/used_windows.py output (DIR/<index dir name>/<index file>.npy): windows never drawn")
     args = ap.parse_args()
     if args.no_split_reductions:
         torch._inductor.config.split_reductions = False
 
-    dist.init_process_group("nccl")
+    dist.init_process_group("nccl", timeout=datetime.timedelta(hours=1))  # startup: --exclude-used sources with few windows left fill the shuffle buffers slowly
     rank, world = dist.get_rank(), dist.get_world_size()
     dev = torch.device("cuda", int(os.environ.get("LOCAL_RANK", 0)))
     torch.cuda.set_device(dev)
@@ -329,13 +348,24 @@ def main():
     step_fn = ddp if args.no_compile else torch.compile(ddp, dynamic=False)  # one graph per --pad-to length
 
     seed = args.seed * 1000 + step
-    parts = [WindowDataset(d, "train", encoder.mean, encoder.stdev, rank, world, seed, *part_paths(part))
+    parts = [WindowDataset(d, "train", encoder.mean, encoder.stdev, rank, world, seed, *part_paths(part),
+                           exclude=args.exclude_used and os.path.join(args.exclude_used, os.path.basename(os.path.normpath(d))))
              for d, part, _ in sources]
     ds = parts[0] if len(parts) == 1 else MixedDataset(parts, [w for _, _, w in sources], seed)
     dl = torch.utils.data.DataLoader(ds, batch_size=args.batch, collate_fn=collate, num_workers=args.workers,
                                      prefetch_factor=4, persistent_workers=True, pin_memory=True,
                                      multiprocessing_context="spawn")  # polars/pod5 threads do not survive fork
-    wb = val = heldout = None
+    wb = None
+    val = {part: fixed_windows(d, "val", args.eval_n, encoder.mean, encoder.stdev, part) for d, part, _ in sources}
+    heldout = fixed_windows(sources[0][0], "heldout", args.eval_n, encoder.mean, encoder.stdev, sources[0][1])
+    base = os.path.join(args.out, "dorado.json")
+    if not os.path.exists(base):  # all ranks decode their share; rank 0 writes
+        with torch.autocast("cuda", dtype=torch.float16):
+            calls = sharded_calls(lambda w: dorado_calls(args.model_dir, encoder, w, dev) if w else [], heldout)
+        if rank == 0:
+            with open(base, "w") as f:
+                json.dump(identity_stats(calls, heldout), f)
+    dist.barrier()
     if rank == 0:
         import wandb
         n_par = sum(p.numel() for p in trainable.parameters())
@@ -346,12 +376,6 @@ def main():
         run_id = wb.id
         print(f"world {world}, {n_par / 1e6:.2f}M trainable, {n_train} train windows = {total} steps/epoch, "
               f"start at {step}, stop at {stop}", flush=True)
-        val = {part: fixed_windows(d, "val", args.eval_n, encoder.mean, encoder.stdev, part) for d, part, _ in sources}
-        heldout = fixed_windows(sources[0][0], "heldout", args.eval_n, encoder.mean, encoder.stdev, sources[0][1])
-        base = os.path.join(args.out, "dorado.json")
-        if not os.path.exists(base):
-            with open(base, "w") as f, torch.autocast("cuda", dtype=torch.float16):
-                json.dump(identity_stats(dorado_calls(args.model_dir, encoder, heldout, dev), heldout), f)
         with open(base) as f:
             wb.summary.update({f"dorado/{k}": v for k, v in json.load(f).items()})
     dist.barrier()
@@ -417,17 +441,21 @@ def main():
                 print(f"step {step} loss {rec['train/loss']:.4f} ce {rec['train/ce']:.4f} align {rec['train/align']:.3f} acc {rec['train/acc']:.4f} lr {lr:.2e} "
                       f"{rec['s_per_step']:.3f} s/step {rec['bases_per_s']:.0f} bases/s", flush=True)
             t0, paused, acc = time.time(), 0.0, torch.zeros(6, device=dev)
-        if step % args.val_every == 0 and rank == 0:
+        if step % args.val_every == 0:  # every rank evaluates a share
             rec = {}
             for i, (part, v) in enumerate(val.items()):
                 rec |= eval_val(model, v, 64, dev, f"val/{part}")
                 if i == 0:
                     rec |= {"val/loss": rec[f"val/{part}/loss"], "val/acc": rec[f"val/{part}/acc"]}
-            wb.log(rec, step=step)
+            if rank == 0:
+                wb.log(rec, step=step)
         if step % args.ckpt_every == 0 or step == stop:
             if rank == 0:
                 save()
-                wb.log(eval_heldout(model, heldout, 256, dev), step=step)
+            dist.barrier()
+            held = eval_heldout(model, heldout, 256, dev)
+            if rank == 0:
+                wb.log(held, step=step)
             dist.barrier()
             t0 = time.time()
     if rank == 0:
