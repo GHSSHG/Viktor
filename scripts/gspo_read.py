@@ -88,18 +88,19 @@ def local_sequence(calls, spans, t, margin):
 
 
 def flank_anchor(flank, truth, left):
-    """Truth position where the own part starts (left neighbour: end of its last ANCHOR bases in truth) or ends (right
-    neighbour: start of its first ANCHOR bases); retried with ANCHOR // 3 bases (the flank may run past the truth end);
-    None when the flank is short or does not align (> 25% edits)."""
+    """Truth positions where the own part may start (left neighbour: ends of its last ANCHOR bases in truth) or end
+    (right neighbour: starts of its first ANCHOR bases), every equally good placement (repeats); retried with
+    ANCHOR // 3 bases (the flank may run past the truth end); [] when the flank is short or does not align (> 25% edits)."""
+    if not flank:
+        return []
     for n in (ANCHOR, ANCHOR // 3):
         part = flank[-n:] if left else flank[:n]
         if len(part) < ANCHOR // 6:
-            return None
+            return []
         r = edlib.align(part, truth, mode="HW", task="locations")
         if 0 <= r["editDistance"] <= 0.25 * len(part):
-            lo, hi = r["locations"][0]
-            return hi + 1 if left else lo
-    return None
+            return sorted({hi + 1 if left else lo for lo, hi in r["locations"]})
+    return []
 
 
 def weighted_errors(q, t, w, mode):
@@ -132,10 +133,11 @@ def read_reward(own, truth, w, left="", right=""):
     (flank_anchor of the left / right flank) and own is aligned end to end into it, so dropped, truncated or duplicated
     bases all count; a side without an anchor (read end, empty or unaligned neighbour) is free in the truth. The
     neighbours' own errors cost nothing (the same for every candidate of a group)."""
-    a = flank_anchor(left, truth, True) if left else None
-    b = flank_anchor(right, truth, False) if right else None
-    if a is not None and b is not None:
-        b = max(a, b)
+    A, B = flank_anchor(left, truth, True), flank_anchor(right, truth, False)
+    a = A[-1] if A else None  # one side only (rare ties): the last left / first right placement
+    b = B[0] if B else None
+    if A and B:  # in repeats: the pair whose span is closest to the own length
+        a, b = min(((x, max(x, y)) for x in A for y in B), key=lambda p: abs(p[1] - p[0] - len(own)))
         err, n_t = weighted_errors(own, truth[a:b], w[a:b], "NW")
     elif b is not None:  # free start: reversed, prefix mode (free end of the target)
         err, n_t = weighted_errors(own[::-1], truth[:b][::-1], w[:b][::-1], "SHW")
