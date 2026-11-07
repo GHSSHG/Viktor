@@ -87,17 +87,19 @@ def local_sequence(calls, spans, t, margin):
     return left, s[start:end], right
 
 
-def flank_anchor(flank, truth, left, n=ANCHOR):
-    """Truth position where the own part starts (left neighbour: end of its last n bases in truth) or ends (right
-    neighbour: start of its first n bases); None when the flank is short or does not align (> 25% edits)."""
-    part = flank[-n:] if left else flank[:n]
-    if len(part) < n // 4:
-        return None
-    r = edlib.align(part, truth, mode="HW", task="locations")
-    if r["editDistance"] < 0 or r["editDistance"] > 0.25 * len(part):
-        return None
-    lo, hi = r["locations"][0]
-    return hi + 1 if left else lo
+def flank_anchor(flank, truth, left):
+    """Truth position where the own part starts (left neighbour: end of its last ANCHOR bases in truth) or ends (right
+    neighbour: start of its first ANCHOR bases); retried with ANCHOR // 3 bases (the flank may run past the truth end);
+    None when the flank is short or does not align (> 25% edits)."""
+    for n in (ANCHOR, ANCHOR // 3):
+        part = flank[-n:] if left else flank[:n]
+        if len(part) < ANCHOR // 6:
+            return None
+        r = edlib.align(part, truth, mode="HW", task="locations")
+        if 0 <= r["editDistance"] <= 0.25 * len(part):
+            lo, hi = r["locations"][0]
+            return hi + 1 if left else lo
+    return None
 
 
 def weighted_errors(q, t, w, mode):
