@@ -4,12 +4,13 @@ A training entry is one chunk k of a read (Dorado chunking as basecall_viktor: 1
 last chunk anchored to the read end) together with its neighbours k-1 and k+1. Every step the neighbours are decoded
 greedily with the current policy (shared by the group), --group candidates of chunk k are sampled, and each candidate
 is stitched with its neighbours exactly as at inference (homopolymer cap, overlap_cut at the overlap middle; adapter
-trim on a read's first chunk). The scored sequence is chunk k's kept span plus --margin bases of each neighbour beyond
-the cuts, so seam errors (duplicated / dropped bases), a derailed or truncated chunk end and clipped read ends all cost
-reward. Truth: the reference bases of the read's stage-6 segment whose signal midpoints lie within chunk k's span +-
---pad samples, extended by --ref-margin bases of the reference on both sides (also past the segment ends); the scored
-sequence is aligned into it (edlib HW: every scored base must align, the truth ends are free). Reward = 1 - errors /
-max(scored length, aligned truth length); errors on masked label bases (index mask_lo / mask_hi, N) do not count.
+trim on a read's first chunk). The aligned sequence is chunk k's kept span plus --margin bases of each neighbour beyond
+the cuts; only the errors of chunk k's own part count (its substitutions / insertions, deletions inside it or at its
+seams), so duplicated / dropped seam bases, a derailed or truncated chunk end and clipped read ends cost reward while
+the neighbours only anchor the alignment. Truth: the reference bases of the read's stage-6 segment whose signal
+midpoints lie within chunk k's span +- --pad samples, extended by --ref-margin bases of the reference on both sides;
+edlib HW (every base must align, the truth ends are free). Reward = 1 - own errors / max(own length, truth bases
+aligned to it); errors on masked label bases (index mask_lo / mask_hi, N) do not count.
 
 prep   (one process, CPU) --reads train-split reads and --eval-reads val-split reads of the --sources (weights: share of
        the reads; default human : bacteria = 4 : 1, split within each as runs/k4.sh) with one stage-6 segment, at least
@@ -20,7 +21,9 @@ prep   (one process, CPU) --reads train-split reads and --eval-reads val-split r
        train windows of the same sources for the SFT term (OUT/readpool/sft.pt).
 train  (torchrun) GSPO as scripts/gspo.py train (sequence ratio per base, clip --eps, advantage over max(group std,
        --std-floor), dead groups dropped, --updates optimiser steps per rollout, gradients averaged over ranks by hand),
-       encoder frozen; plus --sft-weight x the weighted cross-entropy of --sft-per-step replayed SFT windows. Evaluation
+       encoder frozen; plus --sft-weight x the weighted cross-entropy of --sft-per-step replayed SFT windows. Entries
+       are drawn by class (--mix): first a mining pass scores the greedy call of every train entry under --init
+       (readpool/mine.pt, reused while --init is unchanged) and splits human entries into low / mid / perfect. Evaluation
        (rank 0, every --eval-every steps and at the start): the read-level reward of greedy calls of the eval entries
        (read/<group>/... and read/<position>/...), the stratified --eval-windows set and the --eval window sources as
        scripts/gspo.py. Checkpoints as scripts/gspo.py (OUT/last.pt resumes; snapshots carry the tuned encoder).
@@ -82,39 +85,55 @@ def local_sequence(calls, spans, t, margin):
     return left, s[start:end], right
 
 
-def read_reward(seq, truth, w, flank=0):
-    """1 - errors / n: seq aligned into truth (HW: all of seq, truth ends free), errors at truth bases of weight 0 (an
-    insertion: at the truth base before it) not counted; n = max(len(seq), aligned truth length) - flank (the
-    neighbour bases in seq: their errors are the same for every candidate of a group, n counts the candidate's own)."""
+def read_reward(seq, truth, w, lo=0, hi=None):
+    """1 - errors / n over the own part seq[lo:hi]: seq is aligned into truth (HW: all of seq, truth ends free) and only
+    errors of the own part count (substitutions and insertions of its bases, deletions between them or at its two
+    seams); errors at truth bases of weight 0 (an insertion: at the truth base before it) do not count; n = max(own
+    length, truth bases aligned to it). The neighbour bases around it only anchor the alignment: their errors, and their
+    overhang past the truth ends, cost nothing (the same for every candidate of a group)."""
+    hi = len(seq) if hi is None else hi
     if not seq:
         return 0.0
     r = edlib.align(seq, truth, mode="HW", task="path")
-    ti = lo = r["locations"][0][0]
-    err, num = 0.0, ""
+    ti = t0 = r["locations"][0][0]
+    q, err, own_t, num = 0, 0.0, 0, ""
     for ch in r["cigar"]:
         if ch.isdigit():
             num += ch
             continue
         n, num = int(num), ""
-        if ch in "XD":
-            err += float(w[ti:ti + n].sum())
+        if ch == "D":
+            if lo <= q <= hi:
+                err += float(w[ti:ti + n].sum())
+                own_t += n
             ti += n
-        elif ch == "I":
-            err += n * float(w[max(ti - 1, lo)])
-        else:
+            continue
+        a, b = max(q, lo), min(q + n, hi)  # own part of this query run
+        if a < b:
+            if ch == "I":
+                err += (b - a) * float(w[max(ti - 1, t0)])
+            else:
+                own_t += b - a
+                if ch == "X":
+                    err += float(w[ti + a - q:ti + b - q].sum())
+        q += n
+        if ch != "I":
             ti += n
-    return max(0.0, 1 - err / max(max(len(seq), ti - lo) - flank, 1))
+    return max(0.0, 1 - err / max(hi - lo, own_t, 1))
 
 
 def entry_reward(calls, e, margin, cap):
-    """Calls of an entry's chunks (raw decoder output) -> its read-level reward."""
+    """Calls of an entry's chunks (raw decoder output) -> its read-level reward (chunk t's own stitched part)."""
     if cap:
         calls = [cap_homopolymers(c, cap) for c in calls]
     left, kept, right = local_sequence(calls, e["spans"], e["t"], margin)
     seq = left + kept + right
+    lo = len(left)
     if e["pos"] == "first":
-        seq = trim_adapter(seq)
-    return read_reward(seq, e["truth"], e["tw"], len(left) + len(right))
+        trimmed = trim_adapter(seq)
+        lo = max(lo - (len(seq) - len(trimmed)), 0)
+        seq = trimmed
+    return read_reward(seq, e["truth"], e["tw"], lo, max(len(seq) - len(right), lo))
 
 
 def group_rewards(task):
@@ -360,22 +379,52 @@ def train(args, dev, rank, world):
     rng = np.random.default_rng(args.seed * 1000 + step + 7919 * rank)
     group = lambda e: "human" if e["part"] in HUMAN else "bact"
 
-    def read_eval():
-        """Greedy calls of every chunk of the eval entries -> read-level reward statistics."""
-        eng = engine(inf, args.eval_batch)
+    def greedy_rewards(rp, ix, batch):
+        """Read-level rewards of the greedy calls of entries ix of pool rp."""
+        eng = engine(inf, batch)
         rewards = []
-        per = args.eval_batch // 3
-        for i in range(0, len(val.entries), per):
-            ix = list(range(i, min(i + per, len(val.entries))))
-            sig, rows = val.chunks(ix)
+        per = batch // 3
+        for i in range(0, len(ix), per):
+            sub = ix[i:i + per]
+            sig, rows = rp.chunks(sub)
             frames, plens = encode(model, sig, dev)
             calls, _ = run(eng, frames, plens, model.tokenizer)
-            e_ = [val.entries[b] for b in ix]
-            rewards += [x[0] for x in rpool.map(group_rewards, [([calls[r[e["t"]]]], {i: calls[j] for i, j in enumerate(r)}, e,
-                                                                args.margin, args.homopolymer_cap) for r, e in zip(rows, e_)])]
+            rewards += [x[0] for x in rpool.map(group_rewards, [([calls[r[rp.entries[b]["t"]]]], {k: calls[j] for k, j in enumerate(r)},
+                                                                rp.entries[b], args.margin, args.homopolymer_cap)
+                                                               for r, b in zip(rows, sub)])]
         del eng
         torch.cuda.empty_cache()
-        rewards = np.array(rewards)
+        return np.array(rewards)
+
+    # mining: greedy reward of every train entry under the initial policy -> sampling classes (cached per --init)
+    mine_path = os.path.join(pdir, "mine.pt")
+    m = torch.load(mine_path, weights_only=False) if os.path.exists(mine_path) else None
+    if m is None or m["init"] != os.path.abspath(args.init) or len(m["reward"]) != len(pool.entries):
+        t = time.time()
+        part = list(range(rank, len(pool.entries), world))
+        got = [None] * world
+        dist.all_gather_object(got, (part, greedy_rewards(pool, part, args.mine_batch).tolist()))
+        rew = np.zeros(len(pool.entries))
+        for p, r in got:
+            rew[p] = r
+        m = {"init": os.path.abspath(args.init), "reward": rew}
+        if rank == 0:
+            torch.save(m, mine_path)
+            print(f"mined {len(rew)} entries in {time.time() - t:.0f} s", flush=True)
+        dist.barrier()
+    mix = {k: float(v) for k, v in (x.split(":") for x in args.mix.split(","))}
+    cls = np.array(["bact" if group(e) == "bact" else "low" if r < args.low else "mid" if r < args.perfect else "perfect"
+                    for e, r in zip(pool.entries, m["reward"])])
+    members = {k: np.nonzero(cls == k)[0] for k in mix}
+    mix = {k: v for k, v in mix.items() if len(members[k])}
+    classes, probs = list(mix), np.array(list(mix.values())) / sum(mix.values())
+    if rank == 0:
+        print("pool classes: " + ", ".join(f"{k} {len(members[k])} (sampled {p:.2f}, greedy mean {m['reward'][members[k]].mean():.4f})"
+                                         for k, p in zip(classes, probs)), flush=True)
+
+    def read_eval():
+        """Greedy calls of every chunk of the eval entries -> read-level reward statistics."""
+        rewards = greedy_rewards(val, list(range(len(val.entries))), args.eval_batch)
         rec = {}
         for name, sel in [("all", np.ones(len(rewards), bool))] + \
                          [(g, np.array([group(e) == g for e in val.entries])) for g in ("human", "bact")] + \
@@ -395,10 +444,10 @@ def train(args, dev, rank, world):
             rec |= {f"v3/{st}/{k}": v for st, d in r.items() for k, v in d.items() if k != "n"}
             for name, ws in evals.items():
                 rec |= {f"{name}/{k}": v for k, v in identity_stats(heldout_calls(model, ws, args.eval_batch, dev), ws).items()}
-            print(f"eval step {step}: read mean / median / derail {100 * rec['read/all/mean']:.2f} / "
-                  f"{100 * rec['read/all/median']:.2f} / {100 * rec['read/all/derail']:.2f} (human "
-                  f"{100 * rec.get('read/human/mean', 0):.2f}, bact {100 * rec.get('read/bact/mean', 0):.2f}); v3 normal trim "
-                  f"mean / derail {100 * r['normal']['trim_mean']:.2f} / {100 * r['normal']['trim_derail']:.2f}", flush=True)
+            mmd = lambda g: "/".join(f"{100 * rec.get(f'read/{g}/{k}', 0):.2f}" for k in ("mean", "median", "derail"))
+            print(f"eval step {step}: read mean/median/derail human {mmd('human')} | bact {mmd('bact')} | first "
+                  f"{mmd('first')} middle {mmd('middle')} last {mmd('last')}; v3 normal trim mean/derail "
+                  f"{100 * r['normal']['trim_mean']:.2f}/{100 * r['normal']['trim_derail']:.2f}", flush=True)
         dist.barrier()
         return rec
 
@@ -426,7 +475,7 @@ def train(args, dev, rank, world):
         lr = lr_at(args, step)
         for g in opt.param_groups:
             g["lr"] = lr
-        pick = rng.choice(len(pool.entries), B)
+        pick = np.array([rng.choice(members[c]) for c in rng.choice(classes, B, p=probs)])
         ents = [pool.entries[i] for i in pick]
         sig, rows = pool.chunks(pick)
         frames, plens = encode(model, sig, dev)
@@ -556,7 +605,13 @@ def main():
     ap.add_argument("--reads-per-step", type=int, default=64, help="entries per GPU and step")
     ap.add_argument("--group", type=int, default=16)
     ap.add_argument("--temperature", type=float, default=1.0)
-    ap.add_argument("--lr", type=float, default=1e-6, help="peak learning rate")
+    ap.add_argument("--mix", default="low:0.30,mid:0.45,perfect:0.10,bact:0.15",
+                    help="train: sampling share per class (human entries by greedy reward of --init: low < --low <= mid "
+                         "< --perfect <= perfect; bact: all bacterial entries)")
+    ap.add_argument("--low", type=float, default=0.97)
+    ap.add_argument("--perfect", type=float, default=0.995)
+    ap.add_argument("--mine-batch", type=int, default=768, help="train: decode batch of the mining pass")
+    ap.add_argument("--lr", type=float, default=3e-6, help="peak learning rate")
     ap.add_argument("--warmup", type=int, default=50)
     ap.add_argument("--decay-start", type=int, default=1400, help="linear decay to 0 from this step to --steps")
     ap.add_argument("--eps", type=float, default=4e-4, help="GSPO sequence-ratio clip")
