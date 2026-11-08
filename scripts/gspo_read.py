@@ -9,8 +9,8 @@ neighbour and the last ANCHOR bases of the left neighbour beyond the cuts are pl
 fixes the truth span of the own part, and the own part is aligned end to end into that span; so duplicated / dropped
 seam bases, a derailed, truncated or empty chunk all cost reward, while the neighbours' errors do not. At a read end
 the truth span ends at the segment's first / last labelled base (prep: 'lo' / 'hi'): every labelled base must be
-called, and only up to 'free_lo' / 'free_hi' own bases beyond it (adapter, barcode, unlabelled bases: estimated from
-the unlabelled signal there) are free, the rest count as insertions. An entry whose inner side has no anchor (the
+called, and only up to 'free_lo' / 'free_hi' own bases beyond it (adapter rest, barcode, unlabelled bases: estimated
+from the unlabelled signal there, capped per sequencing kit by FREE_CAP) are free, the rest count as insertions. An entry whose inner side has no anchor (the
 neighbour does not align) is not scored (NaN: skipped in mining, training and evaluation). Truth: the reference bases
 of the read's stage-6 segment whose signal midpoints lie within chunk k's span +- --pad samples, extended by
 --ref-margin bases of the reference on both sides. Reward = 1 - errors / max(scored own bases, truth span); errors on
@@ -70,6 +70,12 @@ COLS = ["read_id", "parent_id", "pod5", "split_start", "num_samples", "win", "wi
 _COMP = str.maketrans("ACGTN", "TGCAN")
 ANCHOR = 150  # neighbour bases used to place the own part in the truth
 FREE_X, FREE_PAD = 1.5, 30  # read ends: free own bases beyond the labelled truth (see _prep_file)
+# ... capped per (group, sequencing kit) at (start, end) bases: p95 + ~10 of k4ft2 700k's output beyond its alignment
+# (after trim_adapter, as the reward sees it) on the read-level test sets, 2026-11-08: human LSK114 0 / 11; bacteria
+# LSK114 (lab primer) 86 / 95, LSK114-XL 0 / 21, NBD114-24/-96 47 / 56 (barcode), RBK114-96 (runs with native barcodes) 99 / 78
+FREE_CAP = {("human", "sqk-lsk114"): (10, 20), ("bact", "sqk-lsk114"): (100, 105), ("bact", "sqk-lsk114-xl"): (10, 30),
+            ("bact", "sqk-nbd114-24"): (55, 65), ("bact", "sqk-nbd114-96"): (55, 65), ("bact", "sqk-rbk114-96"): (110, 90)}
+FREE_CAP_DEFAULT = (70, 70)
 
 
 # ---------------------------------------------------------------------------------------------------------- reward
@@ -223,12 +229,14 @@ def _prep_file(job):
     with pod5.Reader(pod5_path(reads[0][0]["pod5"])) as reader:
         for rec in reader.reads(selection=list({rows[0]["parent_id"] for rows in reads}), missing_ok=True):
             recs[str(rec.read_id)] = (rec.signal, rec.calibration.offset, rec.calibration.scale,
-                                      getattr(rec, "open_pore_level", float("nan")), rec.run_info.flow_cell_product_code)
+                                      getattr(rec, "open_pore_level", float("nan")), rec.run_info.flow_cell_product_code,
+                                      rec.run_info.sequencing_kit.lower())
     for rows in reads:
         r0 = rows[0]
         if r0["parent_id"] not in recs:
             continue
-        raw, offset, scale, pore, flow_cell = recs[r0["parent_id"]]
+        raw, offset, scale, pore, flow_cell, kit = recs[r0["parent_id"]]
+        cap_lo, cap_hi = FREE_CAP.get(("human" if part in HUMAN else "bact", kit), FREE_CAP_DEFAULT)
         x = dorado_scale(raw[r0["split_start"]: r0["split_start"] + r0["num_samples"]], offset, scale, P["mean"],
                          P["stdev"], pore, flow_cell)
         n_x = len(x)
@@ -282,11 +290,11 @@ def _prep_file(job):
         for a, b in masked:  # segment base indices -> truth indices
             tw[max(a - j0, 0):max(b - j0, 0)] = 0
         # read end: truth index of the segment's first / last labelled base (segment base i = truth index i - j0) and
-        # the own bases allowed beyond it (adapter, barcode, unlabelled bases: FREE_X x the bases the unlabelled signal
-        # there would carry at the segment's rate, + FREE_PAD)
+        # the own bases allowed beyond it (adapter rest, barcode, unlabelled bases): FREE_X x the bases the unlabelled
+        # signal there would carry at the segment's rate + FREE_PAD, at most the kit's FREE_CAP
         rate = n / max(s_hi - s_lo, 1)
-        edge = {"lo": -j0, "free_lo": int(FREE_X * max(s_lo, 0) * rate) + FREE_PAD} if k == 0 else \
-               {"hi": n - j0, "free_hi": int(FREE_X * max(n_x - s_hi, 0) * rate) + FREE_PAD} if k == last else None
+        edge = {"lo": -j0, "free_lo": min(int(FREE_X * max(s_lo, 0) * rate) + FREE_PAD, cap_lo)} if k == 0 else \
+               {"hi": n - j0, "free_hi": min(int(FREE_X * max(n_x - s_hi, 0) * rate) + FREE_PAD, cap_hi)} if k == last else None
         out.append(({"src": src, "part": part, "read_id": r0["read_id"],
                      "pos": "first" if k == 0 else "last" if k == last else "middle",
                      "spans": [(spans[j][0] - a0, spans[j][1] - a0) for j in ks], "t": ks.index(k),
