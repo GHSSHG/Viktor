@@ -25,7 +25,11 @@ prep   (one process, CPU) --reads train-split reads and --eval-reads val-split r
        train windows of the same sources for the SFT term (OUT/readpool/sft.pt).
 train  (torchrun) GSPO as scripts/gspo.py train (sequence ratio per base, clip --eps, advantage over max(group std,
        --std-floor), dead groups dropped, --updates optimiser steps per rollout, gradients averaged over ranks by hand),
-       encoder frozen; plus --sft-weight x the weighted cross-entropy of --sft-per-step replayed SFT windows. Entries
+       encoder frozen; plus --sft-weight x the weighted cross-entropy of --sft-per-step replayed SFT windows; with
+       --tok-weight > 0 plus a token credit term: in each group a candidate is right at a truth position when it has
+       no error within --tok-window bases, the baseline there is the share of candidates right, every own base gets
+       (right - baseline) at its truth base and a token the mean over its own bases; loss = PPO-clipped token ratio
+       (--tok-eps) x credit, summed over the credited tokens / the call's tokens, x --tok-weight. Entries
        are drawn by class (--mix): first a mining pass scores the greedy call of every train entry under --init
        (readpool/mine.pt, reused while --init is unchanged) and splits human entries into low / mid / perfect. Evaluation
        (rank 0, every --eval-every steps and at the start): the read-level reward of greedy calls of the eval entries
@@ -94,7 +98,7 @@ def local_sequence(calls, spans, t, margin):
         end, cb = overlap_cut(s, b, (spans[t][1] - spans[t + 1][0]) // STRIDE,
                               len(s) / max((spans[t][1] - spans[t][0]) // STRIDE, 1))
         right = b[cb:][:margin]
-    return left, s[start:end], right
+    return left, s[start:end], right, start
 
 
 def flank_anchor(flank, truth, left):
@@ -113,101 +117,150 @@ def flank_anchor(flank, truth, left):
     return []
 
 
-def weighted_errors(q, t, w, mode):
-    """Weighted edit operations of q aligned to t (edlib mode), errors at truth bases of weight 0 (an insertion: at the
-    truth base before it) not counted -> (errors, truth bases consumed)."""
+def align_pairs(own, t, kind):
+    """own aligned to all of truth t: kind 'NW' end to end, 'free_start' / 'free_end' with own's start / end left open
+    -> (alignment columns [(own index or -1, truth index or -1)] in order, own bases left open)."""
+    if kind == "free_start":
+        p, n = align_pairs(own[::-1], t[::-1], "free_end")
+        return [(len(own) - 1 - i if i >= 0 else -1, len(t) - 1 - j if j >= 0 else -1) for i, j in reversed(p)], n
     if not t:
-        return float(len(q)), 0
-    if not q:
-        return (float(w.sum()), len(t)) if mode == "NW" else (0.0, 0)
-    r = edlib.align(q, t, mode=mode, task="path")
-    ti = t0 = r["locations"][0][0]
-    err, num = 0.0, ""
+        return ([(i, -1) for i in range(len(own))], 0) if kind == "NW" else ([], len(own))
+    if not own:
+        return [(-1, j) for j in range(len(t))], 0
+    if kind == "NW":
+        r, ins = edlib.align(own, t, mode="NW", task="path"), "I"  # I: own base without truth base
+    else:
+        r, ins = edlib.align(t, own, mode="SHW", task="path"), "D"  # query = truth (whole), own's end free
+    cols, i, j, num = [], 0, 0, ""
     for ch in r["cigar"]:
         if ch.isdigit():
             num += ch
             continue
-        n, num = int(num), ""
-        if ch in "XD":
-            err += float(w[ti:ti + n].sum())
-            ti += n
-        elif ch == "I":
-            err += n * float(w[max(ti - 1, t0)])
+        for _ in range(int(num)):
+            if ch in "=X":
+                cols.append((i, j)); i += 1; j += 1
+            elif ch == ins:
+                cols.append((i, -1)); i += 1
+            else:
+                cols.append((-1, j)); j += 1
+        num = ""
+    return cols, len(own) - i
+
+
+def score_columns(cols, n_open, own, t, w, free):
+    """-> (weighted errors, own bases scored, truth positions of the errors): a mismatch / missing truth base at its
+    truth base, an extra own base at the truth base before it; errors at weight-0 truth bases do not count; open own
+    bases beyond `free` count as insertions (no position)."""
+    err, prev, pos = 0.0, 0, []
+    for i, j in cols:
+        if j >= 0:
+            prev = j
+            if i < 0 or own[i] != t[j]:
+                err += float(w[j]); pos += [j] if w[j] else []
+        elif len(t):
+            err += float(w[prev]); pos += [prev] if w[prev] else []
         else:
-            ti += n
-    return err, ti - t0
+            err += 1.0
+    over = max(0, n_open - free)
+    return err + over, sum(i >= 0 for i, _ in cols) + over, pos
 
 
-def edge_errors(own, t, w, free, start_free):
-    """All of truth t aligned into own, own's start (start_free) or end left open: up to `free` unaligned own bases
-    there cost nothing, the rest count as insertions -> (weighted errors, own bases scored)."""
-    q, tt, ww = (own[::-1], t[::-1], w[::-1]) if start_free else (own, t, w)
-    if not tt:
-        return float(max(0, len(q) - free)), max(0, len(q) - free)
-    if not q:
-        return float(ww.sum()), 0
-    r = edlib.align(tt, q, mode="SHW", task="path")  # query = truth (whole), target = own from its anchored side
-    ti = qi = 0
-    err, num = 0.0, ""
-    for ch in r["cigar"]:
-        if ch.isdigit():
-            num += ch
-            continue
-        n, num = int(num), ""
-        if ch in "=X":
-            if ch == "X":
-                err += float(ww[ti:ti + n].sum())
-            ti += n
-            qi += n
-        elif ch == "I":  # truth bases missing from own
-            err += float(ww[ti:ti + n].sum())
-            ti += n
-        else:  # "D": own bases with no truth base
-            err += n * float(ww[max(ti - 1, 0)])
-            qi += n
-    over = max(0, len(q) - qi - free)
-    return err + over, qi + over
-
-
-def read_reward(own, truth, w, left="", right="", edge=None):
+def read_reward(own, truth, w, left="", right="", edge=None, detail=False):
     """1 - errors / max(scored own bases, truth bases of the own part). The own part's truth span is fixed on each side
     by the neighbour (flank_anchor of the left / right flank) or, at a read end, by the segment's first / last labelled
     base (edge: lo / hi with free_lo / free_hi own bases beyond it not counted), and every truth base of the span must
     be called, so dropped, truncated or duplicated bases all count. An inner side without an anchor (empty or unaligned
-    neighbour) -> NaN (not scored). The neighbours' own errors cost nothing (the same for every candidate of a group)."""
+    neighbour) -> NaN (not scored). The neighbours' own errors cost nothing (the same for every candidate of a group).
+    detail: -> (reward, (truth offset a, alignment columns, error truth positions)) for token credit."""
     edge = edge or {}
     lo, hi = edge.get("lo"), edge.get("hi")
     A = flank_anchor(left, truth, True) if lo is None else []
     B = flank_anchor(right, truth, False) if hi is None else []
     if (lo is None and not A) or (hi is None and not B):
-        return float("nan")
+        return (float("nan"), None) if detail else float("nan")
     L, R = A or [lo], B or [hi]
     # in repeats: the pair whose span is closest to the own length
     a, b = min(((x, max(x, y)) for x in L for y in R), key=lambda p: abs(p[1] - p[0] - len(own)))
-    if lo is not None:
-        err, n_own = edge_errors(own, truth[a:b], w[a:b], edge["free_lo"], True)
-    elif hi is not None:
-        err, n_own = edge_errors(own, truth[a:b], w[a:b], edge["free_hi"], False)
-    else:
-        err, _ = weighted_errors(own, truth[a:b], w[a:b], "NW")
-        n_own = len(own)
-    return max(0.0, 1 - err / max(n_own, b - a, 1))
+    kind, free = ("free_start", edge["free_lo"]) if lo is not None else ("free_end", edge["free_hi"]) if hi is not None \
+        else ("NW", 0)
+    cols, n_open = align_pairs(own, truth[a:b], kind)
+    err, n_own, pos = score_columns(cols, n_open, own, truth[a:b], w[a:b], free)
+    r = max(0.0, 1 - err / max(n_own, b - a, 1))
+    return (r, (a, cols, pos)) if detail else r
 
 
-def entry_reward(calls, e, margin, cap):
-    """Calls of an entry's chunks (raw decoder output) -> its read-level reward (chunk t's own stitched part)."""
+def entry_reward(calls, e, margin, cap, detail=False):
+    """Calls of an entry's chunks (raw decoder output) -> its read-level reward (chunk t's own stitched part).
+    detail: -> (reward, read_reward detail, raw call index of own base 0 or None when the cap changed the call)."""
+    raw = calls[e["t"]]
     if cap:
         calls = [cap_homopolymers(c, cap) for c in calls]
-    left, kept, right = local_sequence(calls, e["spans"], e["t"], margin)
+    left, kept, right, off = local_sequence(calls, e["spans"], e["t"], margin)
     if e["pos"] == "first":
-        kept = trim_adapter(kept)
-    return read_reward(kept, e["truth"], e["tw"], left, right, e.get("edge"))
+        trimmed = trim_adapter(kept)
+        off, kept = off + len(kept) - len(trimmed), trimmed
+    if not detail:
+        return read_reward(kept, e["truth"], e["tw"], left, right, e.get("edge"))
+    r, d = read_reward(kept, e["truth"], e["tw"], left, right, e.get("edge"), detail=True)
+    return r, d, off if calls[e["t"]] == raw else None
+
+
+def token_credit(details, k, win):
+    """Per-position credit within a group. details: per candidate (read_reward detail, raw offset) or None. A candidate
+    is right at truth position p when it has no error within +- win of p; the baseline at p is the share of the
+    candidates covering p that are right there. Each own base gets (right - baseline) at its truth base (an extra base:
+    the truth base before it); a token gets the mean over its own bases -> per candidate {token index: credit}."""
+    use = [g for g, x in enumerate(details) if x is not None and x[0] is not None and x[1] is not None]
+    out = [{} for _ in details]
+    if len(use) < 2:
+        return out
+    maps = {}
+    for g in use:
+        (a, cols, pos), off = details[g]
+        own_i, tp, js, prev = [], [], [], 0
+        for i, j in cols:
+            if j >= 0:
+                prev = j; js.append(j)
+            if i >= 0:
+                own_i.append(i); tp.append(a + (j if j >= 0 else prev))
+        if js:  # truth span of the candidate (every truth base of it is a column)
+            maps[g] = (np.array(own_i, int), np.array(tp, int), a + np.array(pos, int), off, a + js[0], a + js[-1] + 1)
+    if len(maps) < 2:
+        return out
+    use = list(maps)
+    lo, hi = min(m[4] for m in maps.values()), max(m[5] for m in maps.values())
+    n = hi - lo
+    right = np.zeros((len(use), n)); cover = np.zeros((len(use), n), bool)
+    for r_, g in enumerate(use):
+        _, _, ep, _, s0, s1 = maps[g]
+        cover[r_, s0 - lo:s1 - lo] = True
+        bad = np.zeros(n + 2 * win)
+        np.add.at(bad, ep - lo + win, 1)
+        right[r_] = np.convolve(bad, np.ones(2 * win + 1), "same")[win:win + n] == 0
+    base = (right * cover).sum(0) / np.maximum(cover.sum(0), 1)
+    for r_, g in enumerate(use):
+        own_i, tp, _, off, _, _ = maps[g]
+        if not len(tp):
+            continue
+        c = right[r_, tp - lo] - base[tp - lo]
+        tok = (off + own_i) // k
+        s = np.bincount(tok, c); m = np.bincount(tok)
+        out[g] = {int(t): float(s[t] / m[t]) for t in np.nonzero((m > 0) & (np.abs(s) > 1e-9))[0]}
+    return out
 
 
 def group_rewards(task):
-    """(candidate calls of chunk t, the entry's neighbour calls by chunk index, entry, margin, cap) -> rewards."""
-    cands, nb, e, margin, cap = task
-    return [entry_reward([c if i == e["t"] else nb[i] for i in range(len(e["spans"]))], e, margin, cap) for c in cands]
+    """(candidate calls of chunk t, the entry's neighbour calls by chunk index, entry, margin, cap[, (k, win)]) ->
+    rewards, or with (k, win): (rewards, per candidate token credit)."""
+    cands, nb, e, margin, cap = task[:5]
+    calls = lambda c: [c if i == e["t"] else nb[i] for i in range(len(e["spans"]))]
+    if len(task) < 6 or task[5] is None:
+        return [entry_reward(calls(c), e, margin, cap) for c in cands]
+    res = [entry_reward(calls(c), e, margin, cap, detail=True) for c in cands]
+    rewards = [r for r, _, _ in res]
+    if any(np.isnan(rewards)):
+        return rewards, [{} for _ in cands]
+    return rewards, token_credit([(d, off) for _, d, off in res], *task[5])
 
 
 # ------------------------------------------------------------------------------------------------------------ prep
@@ -565,17 +618,28 @@ def train(args, dev, rank, world):
         tf, tp = frames[tgt], plens[tgt]
         calls, ended = decode(roll, tf.repeat_interleave(G, 0), tp.repeat_interleave(G), model.tokenizer)
         t_roll = time.time() - t0
+        credit_args = (model.tokenizer.k, args.tok_window) if args.tok_weight > 0 else None
         tasks = [(calls[b * G:(b + 1) * G], {i: nb_calls[c] for i, c in enumerate(rows[b]) if i != e["t"]}, e,
-                  args.margin, args.homopolymer_cap) for b, e in enumerate(ents)]
-        reward = np.array(rpool.map(group_rewards, tasks))
+                  args.margin, args.homopolymer_cap, credit_args) for b, e in enumerate(ents)]
+        res = rpool.map(group_rewards, tasks)
+        if credit_args:
+            reward, credit = np.array([r for r, _ in res]), [c for _, c in res]
+        else:
+            reward, credit = np.array(res), [[{}] * G for _ in res]
         t_rew = time.time() - t0 - t_roll
         ok = ~np.isnan(reward).any(1)  # a group with an unscored candidate (neighbour does not align) is dropped
         reward[~ok] = 0.0
         std = reward.std(1)
-        live = np.nonzero(ok & (std > 1e-6))[0]
+        has_credit = np.array([any(c) for c in credit])
+        live = np.nonzero(ok & ((std > 1e-6) | has_credit))[0]
         adv = (reward - reward.mean(1, keepdims=True)) / np.maximum(std, args.std_floor)[:, None]
         seqs = [(b, j) for b in live for j in range(G)]
         n_bases = {bj: max(len(calls[bj[0] * G + bj[1]]), 1) for bj in seqs}
+        tok_adv = {}  # (b, j) -> (token indices, credits) on the device
+        for bj in seqs:
+            c = credit[bj[0]][bj[1]]
+            if c:
+                tok_adv[bj] = (torch.tensor(list(c), device=dev), torch.tensor(list(c.values()), device=dev, dtype=torch.float32))
 
         def logprobs(mb):
             ix = [b for b, _ in mb]
@@ -590,7 +654,7 @@ def train(args, dev, rank, world):
                     old[bj] = lp[k][m[k]]
         sft_pick = torch.from_numpy(rng.choice(len(sft["seq"]), args.sft_per_step))
         sft_frames, sft_plens = model.encode(sft["sig"][sft_pick][:, None].to(dev), sft["valid"][sft_pick])
-        stats = {"pg": 0.0, "ce": 0.0, "clip": 0.0, "ratio": 0.0, "n": 0}
+        stats = {"pg": 0.0, "ce": 0.0, "clip": 0.0, "ratio": 0.0, "n": 0, "tok": 0.0, "tok_n": 0, "tok_clip": 0.0, "tokens": 0}
         for u in range(args.updates):
             mine = [bj for bj in seqs if bj[0] % args.updates == u]
             wins = [b for b in range(len(sft_pick)) if b % args.updates == u]
@@ -598,10 +662,25 @@ def train(args, dev, rank, world):
             for i in range(0, len(mine), args.micro):
                 mb = mine[i:i + args.micro]
                 lp, m = logprobs(mb)
-                s = torch.stack([((lp[k][m[k]] - old[bj]).sum() / n_bases[bj]).exp() for k, bj in enumerate(mb)])
+                lps = [lp[k][m[k]] for k in range(len(mb))]
+                s = torch.stack([((x - old[bj]).sum() / n_bases[bj]).exp() for x, bj in zip(lps, mb)])
                 a = torch.tensor([adv[b, j] for b, j in mb], device=dev, dtype=torch.float32)
                 pg = -torch.minimum(s * a, s.clamp(1 - args.eps, 1 + args.eps) * a)
-                (pg.sum() / len(mine)).backward()
+                loss = pg.sum()
+                # token term: PPO-clipped token ratio x position credit, summed over the credited tokens / the call's tokens
+                for x, bj in zip(lps, mb):
+                    stats["tokens"] += len(x)
+                    if bj not in tok_adv:
+                        continue
+                    idx, c = tok_adv[bj]
+                    keep = idx < len(x)
+                    idx, c = idx[keep], c[keep]
+                    rt = (x[idx] - old[bj][idx]).exp()
+                    lt = -torch.minimum(rt * c, rt.clamp(1 - args.tok_eps, 1 + args.tok_eps) * c).sum() / len(x)
+                    loss = loss + args.tok_weight * lt
+                    stats["tok"] += float(lt.detach()); stats["tok_n"] += len(idx)
+                    stats["tok_clip"] += float(((rt.detach() - 1).abs() > args.tok_eps).sum())
+                (loss / len(mine)).backward()
                 stats["pg"] += float(pg.detach().sum()); stats["n"] += len(mb)
                 stats["clip"] += float(((s - 1).abs() > args.eps).sum()); stats["ratio"] += float((s.detach() - 1).abs().sum())
             for i in range(0, len(wins), args.micro):
@@ -627,16 +706,18 @@ def train(args, dev, rank, world):
                                                G * sum(sel(kind, v, b, e) for b, e in enumerate(ents)))]
         r_ok = reward[ok]
         tot = torch.tensor([r_ok.sum(), r_ok.max(1).sum() if len(r_ok) else 0.0, (r_ok < 0.9).sum(), r_ok.size, len(live), int(ok.sum()),
-                            sum(ended), len(ended), stats["pg"], stats["ce"], stats["clip"], stats["ratio"], stats["n"]] + per,
+                            sum(ended), len(ended), stats["pg"], stats["ce"], stats["clip"], stats["ratio"], stats["n"],
+                            stats["tok"], stats["tok_n"], stats["tok_clip"], stats["tokens"]] + per,
                            device=dev, dtype=torch.float64)
         dist.all_reduce(tot)
-        r_sum, best, der, n_r, n_live, n_win, n_end, n_calls, pg, ce, clip, ratio, n = tot.tolist()[:13]
-        per = tot.tolist()[13:]
+        r_sum, best, der, n_r, n_live, n_win, n_end, n_calls, pg, ce, clip, ratio, n, tok, tok_n, tok_clip, tokens = tot.tolist()[:17]
+        per = tot.tolist()[17:]
         n = max(n, 1)
         rec = {f"reward_{kind}/{v}": per[2 * i] / per[2 * i + 1] for i, (kind, v) in enumerate(keys) if per[2 * i + 1]}
         rec |= {"reward/mean": r_sum / n_r, "reward/best_of_group": best / n_win, "reward/derail": der / n_r,
                 "groups_live": n_live / n_win, "ended": n_end / n_calls, "pg": pg / n, "ce": ce / (args.sft_per_step * world),
                 "clip_frac": clip / n, "ratio_dev": ratio / n, "grad_norm": float(gnorm), "lr": lr,
+                "tok/loss": tok / n, "tok/credited_frac": tok_n / max(tokens, 1), "tok/clip_frac": tok_clip / max(tok_n, 1),
                 "s_rollout": t_roll, "s_reward": t_rew, "s_per_step": time.time() - t0 - paused, "paused_s": paused,
                 "gpu/temp": torch.cuda.temperature(dev)}
         if step % args.eval_every == 0 or step == args.steps:
@@ -647,6 +728,7 @@ def train(args, dev, rank, world):
             if step % 10 == 0 or step <= 10:
                 print(f"step {step} reward {rec['reward/mean']:.4f} live {rec['groups_live']:.2f} pg {rec['pg']:.4f} "
                       f"ce {rec['ce']:.4f} clip {rec['clip_frac']:.3f} ratio {rec['ratio_dev']:.5f} "
+                      f"tok {rec['tok/loss']:.5f} credited {rec['tok/credited_frac']:.4f} tok_clip {rec['tok/clip_frac']:.3f} "
                       f"rollout {t_roll:.1f} s reward {t_rew:.1f} s {rec['s_per_step']:.1f} s/step", flush=True)
     rpool.close()
     if rank == 0:
@@ -701,6 +783,10 @@ def main():
     ap.add_argument("--decay-start", type=int, default=1400, help="linear decay to 0 from this step to --steps")
     ap.add_argument("--eps", type=float, default=4e-4, help="GSPO sequence-ratio clip")
     ap.add_argument("--std-floor", type=float, default=0.003, help="advantage: group reward std floor")
+    ap.add_argument("--tok-weight", type=float, default=0.0, help="token credit term weight (0: sequence-level only)")
+    ap.add_argument("--tok-eps", type=float, default=0.2, help="token credit term: token-ratio clip")
+    ap.add_argument("--tok-window", type=int, default=2, help="token credit: a candidate is right at a truth position "
+                                                                "when it has no error within this many bases")
     ap.add_argument("--updates", type=int, default=2, help="optimiser steps per rollout")
     ap.add_argument("--sft-weight", type=float, default=0.05)
     ap.add_argument("--sft-per-step", type=int, default=32, help="SFT replay windows per GPU and step")
