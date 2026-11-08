@@ -33,7 +33,7 @@ train  every step: --windows-per-step pool windows drawn by class shares --mix, 
        minibatches, one optimiser step each; pi_old = the policy before the first. Every rank rolls out its own
        --windows-per-step windows; gradients are averaged over ranks before each optimiser step (by hand: the
        number of live groups differs per rank), so the replicas stay identical. Learning rate: linear warmup over
-       --warmup steps, constant, linear decay to 0 from --decay-start to --steps.
+       --warmup steps, constant, 1 - sqrt decay to 0 from --decay-start to --steps (as scripts/train.py).
        Evaluation (rank 0, every --eval-every steps, and at the start): greedy decoding of the stratified
        --eval-windows set scored as scripts/evaluate.py (v3/<stratum>/..., v3/natural/...), and of fixed windows of
        each --eval source (DIR:PART:SPLIT, sampled as train.py's heldout; train.py's identity). Temperature guard
@@ -52,6 +52,7 @@ import argparse
 import copy
 import datetime
 import glob
+import math
 import os
 import re
 import time
@@ -353,9 +354,12 @@ def token_logprobs(model, frames, plens, seqs, ended):
 
 
 def lr_at(args, step):
-    """Linear warmup over --warmup steps, constant, then linear decay to 0 from --decay-start to --steps."""
+    """Linear warmup over --warmup steps, constant, then 1 - sqrt decay to 0 from --decay-start to --steps (WSD as
+    scripts/train.py)."""
     lr = args.lr * min(1.0, (step + 1) / args.warmup)
-    return lr if step < args.decay_start else lr * (args.steps - step) / (args.steps - args.decay_start)
+    if step < args.decay_start:
+        return lr
+    return lr * (1 - math.sqrt((step - args.decay_start) / max(1, args.steps - args.decay_start)))
 
 
 def train(args, dev, rank, world):
@@ -549,7 +553,7 @@ def main():
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--lr", type=float, default=1e-6, help="peak learning rate")
     ap.add_argument("--warmup", type=int, default=50)
-    ap.add_argument("--decay-start", type=int, default=1400, help="linear decay to 0 from this step to --steps")
+    ap.add_argument("--decay-start", type=int, default=1400, help="1 - sqrt decay to 0 from this step to --steps")
     ap.add_argument("--eps", type=float, default=4e-4, help="GSPO sequence-ratio clip")
     ap.add_argument("--std-floor", type=float, default=0.003, help="advantage: group reward std floor")
     ap.add_argument("--updates", type=int, default=2, help="optimiser steps per rollout")

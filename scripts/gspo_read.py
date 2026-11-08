@@ -655,7 +655,7 @@ def train(args, dev, rank, world):
                     old[bj] = lp[k][m[k]]
         sft_pick = torch.from_numpy(rng.choice(len(sft["seq"]), args.sft_per_step))
         sft_frames, sft_plens = model.encode(sft["sig"][sft_pick][:, None].to(dev), sft["valid"][sft_pick])
-        stats = {"pg": 0.0, "ce": 0.0, "clip": 0.0, "ratio": 0.0, "n": 0, "tok": 0.0, "tok_n": 0, "tok_clip": 0.0, "tokens": 0}
+        stats = {"pg": 0.0, "ce": 0.0, "clip": 0.0, "ratio": 0.0, "n": 0, "tok": 0.0, "tok_n": 0, "tok_clip": 0.0, "tokens": 0, "tok_abs": 0.0}
         for u in range(args.updates):
             mine = [bj for bj in seqs if bj[0] % args.updates == u]
             wins = [b for b in range(len(sft_pick)) if b % args.updates == u]
@@ -680,7 +680,7 @@ def train(args, dev, rank, world):
                     lt = -torch.minimum(rt * c, rt.clamp(1 - args.tok_eps, 1 + args.tok_eps) * c).sum() / len(x)
                     loss = loss + args.tok_weight * lt
                     stats["tok"] += float(lt.detach()); stats["tok_n"] += len(idx)
-                    stats["tok_clip"] += float(((rt.detach() - 1).abs() > args.tok_eps).sum())
+                    stats["tok_clip"] += float(((rt.detach() - 1).abs() > args.tok_eps).sum()); stats["tok_abs"] += float(c.abs().sum())
                 (loss / len(mine)).backward()
                 stats["pg"] += float(pg.detach().sum()); stats["n"] += len(mb)
                 stats["clip"] += float(((s - 1).abs() > args.eps).sum()); stats["ratio"] += float((s.detach() - 1).abs().sum())
@@ -708,17 +708,18 @@ def train(args, dev, rank, world):
         r_ok = reward[ok]
         tot = torch.tensor([r_ok.sum(), r_ok.max(1).sum() if len(r_ok) else 0.0, (r_ok < 0.9).sum(), r_ok.size, len(live), int(ok.sum()),
                             sum(ended), len(ended), stats["pg"], stats["ce"], stats["clip"], stats["ratio"], stats["n"],
-                            stats["tok"], stats["tok_n"], stats["tok_clip"], stats["tokens"]] + per,
+                            stats["tok"], stats["tok_n"], stats["tok_clip"], stats["tokens"], stats["tok_abs"]] + per,
                            device=dev, dtype=torch.float64)
         dist.all_reduce(tot)
-        r_sum, best, der, n_r, n_live, n_win, n_end, n_calls, pg, ce, clip, ratio, n, tok, tok_n, tok_clip, tokens = tot.tolist()[:17]
-        per = tot.tolist()[17:]
+        r_sum, best, der, n_r, n_live, n_win, n_end, n_calls, pg, ce, clip, ratio, n, tok, tok_n, tok_clip, tokens, tok_abs = tot.tolist()[:18]
+        per = tot.tolist()[18:]
         n = max(n, 1)
         rec = {f"reward_{kind}/{v}": per[2 * i] / per[2 * i + 1] for i, (kind, v) in enumerate(keys) if per[2 * i + 1]}
         rec |= {"reward/mean": r_sum / n_r, "reward/best_of_group": best / n_win, "reward/derail": der / n_r,
                 "groups_live": n_live / n_win, "ended": n_end / n_calls, "pg": pg / n, "ce": ce / (args.sft_per_step * world),
                 "clip_frac": clip / n, "ratio_dev": ratio / n, "grad_norm": float(gnorm), "lr": lr,
                 "tok/loss": tok / n, "tok/credited_frac": tok_n / max(tokens, 1), "tok/clip_frac": tok_clip / max(tok_n, 1),
+                "tok/mean_abs_credit": tok_abs / max(tok_n, 1),
                 "s_rollout": t_roll, "s_reward": t_rew, "s_per_step": time.time() - t0 - paused, "paused_s": paused,
                 "gpu/temp": torch.cuda.temperature(dev)}
         if step % args.eval_every == 0 or step == args.steps:
@@ -729,7 +730,7 @@ def train(args, dev, rank, world):
             if step % 10 == 0 or step <= 10:
                 print(f"step {step} reward {rec['reward/mean']:.4f} live {rec['groups_live']:.2f} pg {rec['pg']:.4f} "
                       f"ce {rec['ce']:.4f} clip {rec['clip_frac']:.3f} ratio {rec['ratio_dev']:.5f} "
-                      f"tok {rec['tok/loss']:.5f} credited {rec['tok/credited_frac']:.4f} tok_clip {rec['tok/clip_frac']:.3f} "
+                      f"tok {rec['tok/loss']:.5f} credited {rec['tok/credited_frac']:.4f} |c| {rec['tok/mean_abs_credit']:.3f} tok_clip {rec['tok/clip_frac']:.3f} "
                       f"rollout {t_roll:.1f} s reward {t_rew:.1f} s {rec['s_per_step']:.1f} s/step", flush=True)
     rpool.close()
     if rank == 0:
@@ -782,7 +783,7 @@ def main():
     ap.add_argument("--mine-init", help="train: reuse the mining classes of this checkpoint (default --init)")
     ap.add_argument("--lr", type=float, default=3e-6, help="peak learning rate")
     ap.add_argument("--warmup", type=int, default=50)
-    ap.add_argument("--decay-start", type=int, default=1400, help="linear decay to 0 from this step to --steps")
+    ap.add_argument("--decay-start", type=int, default=1400, help="1 - sqrt decay to 0 from this step to --steps")
     ap.add_argument("--eps", type=float, default=4e-4, help="GSPO sequence-ratio clip")
     ap.add_argument("--std-floor", type=float, default=0.003, help="advantage: group reward std floor")
     ap.add_argument("--tok-weight", type=float, default=0.0, help="token credit term weight (0: sequence-level only)")
