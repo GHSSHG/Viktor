@@ -531,7 +531,8 @@ def train(args, dev, rank, world):
     # mining: greedy reward of every train entry under the initial policy -> sampling classes (cached per --init)
     mine_path = os.path.join(pdir, "mine.pt")
     m = torch.load(mine_path, weights_only=False) if os.path.exists(mine_path) else None
-    if m is None or m["init"] != os.path.abspath(args.init) or len(m["reward"]) != len(pool.entries):
+    key = os.path.abspath(args.mine_init or args.init)
+    if m is None or m["init"] != key or len(m["reward"]) != len(pool.entries):
         t = time.time()
         part = list(range(rank, len(pool.entries), world))
         got = [None] * world
@@ -539,7 +540,7 @@ def train(args, dev, rank, world):
         rew = np.zeros(len(pool.entries))
         for p, r in got:
             rew[p] = r
-        m = {"init": os.path.abspath(args.init), "reward": rew}
+        m = {"init": key, "reward": rew}
         if rank == 0:
             torch.save(m, mine_path)
             print(f"mined {len(rew)} entries in {time.time() - t:.0f} s", flush=True)
@@ -778,6 +779,7 @@ def main():
     ap.add_argument("--low", type=float, default=0.97)
     ap.add_argument("--perfect", type=float, default=0.995)
     ap.add_argument("--mine-batch", type=int, default=768, help="train: decode batch of the mining pass")
+    ap.add_argument("--mine-init", help="train: reuse the mining classes of this checkpoint (default --init)")
     ap.add_argument("--lr", type=float, default=3e-6, help="peak learning rate")
     ap.add_argument("--warmup", type=int, default=50)
     ap.add_argument("--decay-start", type=int, default=1400, help="linear decay to 0 from this step to --steps")
