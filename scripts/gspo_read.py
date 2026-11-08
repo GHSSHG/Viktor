@@ -662,8 +662,8 @@ def main():
     ap.add_argument("--eval-reads", type=int, default=1024, help="prep: evaluation entries (val split)")
     ap.add_argument("--sft-windows", type=int, default=16_000, help="prep: SFT replay windows")
     ap.add_argument("--edge-share", type=float, default=0.3, help="prep: share of first / last chunks")
-    ap.add_argument("--edge-slack", type=int, default=6000, help="prep: first / last chunk only if the segment reaches "
-                                                                 "within this many samples of the read end")
+    ap.add_argument("--edge-slack", type=int, default=2500, help="prep: first / last chunk only if the segment reaches "
+                                                                 "within this many samples of the read end (bounds the free own bases there)")
     ap.add_argument("--pad", type=int, default=6000, help="prep: truth = bases within chunk k +- this many samples "
                                                           "(> --margin bases of signal)")
     ap.add_argument("--ref-margin", type=int, default=50, help="prep: ... + this many reference bases on both sides")
