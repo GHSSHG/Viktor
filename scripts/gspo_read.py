@@ -7,11 +7,14 @@ is stitched with its neighbours exactly as at inference (homopolymer cap, overla
 trim on a read's first chunk). Only chunk k's own stitched part is scored: the first ANCHOR bases of the right
 neighbour and the last ANCHOR bases of the left neighbour beyond the cuts are placed in the truth (edlib HW), which
 fixes the truth span of the own part, and the own part is aligned end to end into that span; so duplicated / dropped
-seam bases, a derailed, truncated or empty chunk all cost reward, while the neighbours' errors do not (a side without
-a neighbour, e.g. the read ends, is free in the truth). Truth: the reference bases of the read's stage-6 segment whose
-signal midpoints lie within chunk k's span +- --pad samples, extended by --ref-margin bases of the reference on both
-sides. Reward = 1 - errors / max(own length, truth span); errors on masked label bases (index mask_lo / mask_hi, N)
-do not count.
+seam bases, a derailed, truncated or empty chunk all cost reward, while the neighbours' errors do not. At a read end
+the truth span ends at the segment's first / last labelled base (prep: 'lo' / 'hi'): every labelled base must be
+called, and only up to 'free_lo' / 'free_hi' own bases beyond it (adapter, barcode, unlabelled bases: estimated from
+the unlabelled signal there) are free, the rest count as insertions. An entry whose inner side has no anchor (the
+neighbour does not align) is not scored (NaN: skipped in mining, training and evaluation). Truth: the reference bases
+of the read's stage-6 segment whose signal midpoints lie within chunk k's span +- --pad samples, extended by
+--ref-margin bases of the reference on both sides. Reward = 1 - errors / max(scored own bases, truth span); errors on
+masked label bases (index mask_lo / mask_hi, N) do not count.
 
 prep   (one process, CPU) --reads train-split reads and --eval-reads val-split reads of the --sources (weights: share of
        the reads; default human : bacteria = 4 : 1, split within each as runs/k4.sh) with one stage-6 segment, at least
@@ -66,6 +69,7 @@ COLS = ["read_id", "parent_id", "pod5", "split_start", "num_samples", "win", "wi
         "g_hi", "mask_lo", "mask_hi", "seg_off", "seg_n", "f_first", "f_exit", "ad_i0", "ad_i1", "label", "lw", "split", "w"]
 _COMP = str.maketrans("ACGTN", "TGCAN")
 ANCHOR = 150  # neighbour bases used to place the own part in the truth
+FREE_X, FREE_PAD = 1.5, 30  # read ends: free own bases beyond the labelled truth (see _prep_file)
 
 
 # ---------------------------------------------------------------------------------------------------------- reward
@@ -128,26 +132,60 @@ def weighted_errors(q, t, w, mode):
     return err, ti - t0
 
 
-def read_reward(own, truth, w, left="", right=""):
-    """1 - errors / max(len(own), truth bases of the own part): the own part's truth span is fixed by the neighbours
-    (flank_anchor of the left / right flank) and own is aligned end to end into it, so dropped, truncated or duplicated
-    bases all count; a side without an anchor (read end, empty or unaligned neighbour) is free in the truth. The
-    neighbours' own errors cost nothing (the same for every candidate of a group)."""
-    A, B = flank_anchor(left, truth, True), flank_anchor(right, truth, False)
-    a = A[-1] if A else None  # one side only (rare ties): the last left / first right placement
-    b = B[0] if B else None
-    if A and B:  # in repeats: the pair whose span is closest to the own length
-        a, b = min(((x, max(x, y)) for x in A for y in B), key=lambda p: abs(p[1] - p[0] - len(own)))
-        err, n_t = weighted_errors(own, truth[a:b], w[a:b], "NW")
-    elif b is not None:  # free start: reversed, prefix mode (free end of the target)
-        err, n_t = weighted_errors(own[::-1], truth[:b][::-1], w[:b][::-1], "SHW")
-    elif a is not None:
-        err, n_t = weighted_errors(own, truth[a:], w[a:], "SHW")
+def edge_errors(own, t, w, free, start_free):
+    """All of truth t aligned into own, own's start (start_free) or end left open: up to `free` unaligned own bases
+    there cost nothing, the rest count as insertions -> (weighted errors, own bases scored)."""
+    q, tt, ww = (own[::-1], t[::-1], w[::-1]) if start_free else (own, t, w)
+    if not tt:
+        return float(max(0, len(q) - free)), max(0, len(q) - free)
+    if not q:
+        return float(ww.sum()), 0
+    r = edlib.align(tt, q, mode="SHW", task="path")  # query = truth (whole), target = own from its anchored side
+    ti = qi = 0
+    err, num = 0.0, ""
+    for ch in r["cigar"]:
+        if ch.isdigit():
+            num += ch
+            continue
+        n, num = int(num), ""
+        if ch in "=X":
+            if ch == "X":
+                err += float(ww[ti:ti + n].sum())
+            ti += n
+            qi += n
+        elif ch == "I":  # truth bases missing from own
+            err += float(ww[ti:ti + n].sum())
+            ti += n
+        else:  # "D": own bases with no truth base
+            err += n * float(ww[max(ti - 1, 0)])
+            qi += n
+    over = max(0, len(q) - qi - free)
+    return err + over, qi + over
+
+
+def read_reward(own, truth, w, left="", right="", edge=None):
+    """1 - errors / max(scored own bases, truth bases of the own part). The own part's truth span is fixed on each side
+    by the neighbour (flank_anchor of the left / right flank) or, at a read end, by the segment's first / last labelled
+    base (edge: lo / hi with free_lo / free_hi own bases beyond it not counted), and every truth base of the span must
+    be called, so dropped, truncated or duplicated bases all count. An inner side without an anchor (empty or unaligned
+    neighbour) -> NaN (not scored). The neighbours' own errors cost nothing (the same for every candidate of a group)."""
+    edge = edge or {}
+    lo, hi = edge.get("lo"), edge.get("hi")
+    A = flank_anchor(left, truth, True) if lo is None else []
+    B = flank_anchor(right, truth, False) if hi is None else []
+    if (lo is None and not A) or (hi is None and not B):
+        return float("nan")
+    L, R = A or [lo], B or [hi]
+    # in repeats: the pair whose span is closest to the own length
+    a, b = min(((x, max(x, y)) for x in L for y in R), key=lambda p: abs(p[1] - p[0] - len(own)))
+    if lo is not None:
+        err, n_own = edge_errors(own, truth[a:b], w[a:b], edge["free_lo"], True)
+    elif hi is not None:
+        err, n_own = edge_errors(own, truth[a:b], w[a:b], edge["free_hi"], False)
     else:
-        err, n_t = weighted_errors(own, truth, w, "HW")
-    if not own and (a is None or b is None):
-        return 0.0
-    return max(0.0, 1 - err / max(len(own), n_t, 1))
+        err, _ = weighted_errors(own, truth[a:b], w[a:b], "NW")
+        n_own = len(own)
+    return max(0.0, 1 - err / max(n_own, b - a, 1))
 
 
 def entry_reward(calls, e, margin, cap):
@@ -157,7 +195,7 @@ def entry_reward(calls, e, margin, cap):
     left, kept, right = local_sequence(calls, e["spans"], e["t"], margin)
     if e["pos"] == "first":
         kept = trim_adapter(kept)
-    return read_reward(kept, e["truth"], e["tw"], left, right)
+    return read_reward(kept, e["truth"], e["tw"], left, right, e.get("edge"))
 
 
 def group_rewards(task):
@@ -243,10 +281,16 @@ def _prep_file(job):
         tw = (np.frombuffer(truth.encode(), np.uint8) != ord("N")).astype(np.uint8)
         for a, b in masked:  # segment base indices -> truth indices
             tw[max(a - j0, 0):max(b - j0, 0)] = 0
+        # read end: truth index of the segment's first / last labelled base (segment base i = truth index i - j0) and
+        # the own bases allowed beyond it (adapter, barcode, unlabelled bases: FREE_X x the bases the unlabelled signal
+        # there would carry at the segment's rate, + FREE_PAD)
+        rate = n / max(s_hi - s_lo, 1)
+        edge = {"lo": -j0, "free_lo": int(FREE_X * max(s_lo, 0) * rate) + FREE_PAD} if k == 0 else \
+               {"hi": n - j0, "free_hi": int(FREE_X * max(n_x - s_hi, 0) * rate) + FREE_PAD} if k == last else None
         out.append(({"src": src, "part": part, "read_id": r0["read_id"],
                      "pos": "first" if k == 0 else "last" if k == last else "middle",
                      "spans": [(spans[j][0] - a0, spans[j][1] - a0) for j in ks], "t": ks.index(k),
-                     "truth": truth, "tw": tw}, x[a0:spans[ks[-1]][1]].copy()))
+                     "truth": truth, "tw": tw, "edge": edge}, x[a0:spans[ks[-1]][1]].copy()))
     return out
 
 
@@ -440,22 +484,23 @@ def train(args, dev, rank, world):
             print(f"mined {len(rew)} entries in {time.time() - t:.0f} s", flush=True)
         dist.barrier()
     mix = {k: float(v) for k, v in (x.split(":") for x in args.mix.split(","))}
-    cls = np.array(["bact" if group(e) == "bact" else "low" if r < args.low else "mid" if r < args.perfect else "perfect"
-                    for e, r in zip(pool.entries, m["reward"])])
+    cls = np.array(["skip" if np.isnan(r) else "bact" if group(e) == "bact" else "low" if r < args.low else
+                    "mid" if r < args.perfect else "perfect" for e, r in zip(pool.entries, m["reward"])])
     members = {k: np.nonzero(cls == k)[0] for k in mix}
     mix = {k: v for k, v in mix.items() if len(members[k])}
     classes, probs = list(mix), np.array(list(mix.values())) / sum(mix.values())
     if rank == 0:
         print("pool classes: " + ", ".join(f"{k} {len(members[k])} (sampled {p:.2f}, greedy mean {m['reward'][members[k]].mean():.4f})"
-                                         for k, p in zip(classes, probs)), flush=True)
+                                         for k, p in zip(classes, probs)) + f"; not scored {int((cls == 'skip').sum())}", flush=True)
 
     def read_eval():
         """Greedy calls of every chunk of the eval entries -> read-level reward statistics."""
         rewards = greedy_rewards(val, list(range(len(val.entries))), args.eval_batch)
-        rec = {}
-        for name, sel in [("all", np.ones(len(rewards), bool))] + \
-                         [(g, np.array([group(e) == g for e in val.entries])) for g in ("human", "bact")] + \
-                         [(p, np.array([e["pos"] == p for e in val.entries])) for p in POSITIONS]:
+        ok = ~np.isnan(rewards)
+        rec = {"read/not_scored": int((~ok).sum())}
+        for name, sel in [("all", ok)] + \
+                         [(g, ok & np.array([group(e) == g for e in val.entries])) for g in ("human", "bact")] + \
+                         [(p, ok & np.array([e["pos"] == p for e in val.entries])) for p in POSITIONS]:
             if sel.any():
                 r = rewards[sel]
                 rec |= {f"read/{name}/mean": float(r.mean()), f"read/{name}/median": float(np.median(r)),
@@ -473,7 +518,7 @@ def train(args, dev, rank, world):
                 rec |= {f"{name}/{k}": v for k, v in identity_stats(heldout_calls(model, ws, args.eval_batch, dev), ws).items()}
             mmd = lambda g: "/".join(f"{100 * rec.get(f'read/{g}/{k}', 0):.2f}" for k in ("mean", "median", "derail"))
             print(f"eval step {step}: read mean/median/derail human {mmd('human')} | bact {mmd('bact')} | first "
-                  f"{mmd('first')} middle {mmd('middle')} last {mmd('last')}; v3 normal trim mean/derail "
+                  f"{mmd('first')} middle {mmd('middle')} last {mmd('last')} (not scored {rec['read/not_scored']}); v3 normal trim mean/derail "
                   f"{100 * r['normal']['trim_mean']:.2f}/{100 * r['normal']['trim_derail']:.2f}", flush=True)
         dist.barrier()
         return rec
@@ -516,8 +561,10 @@ def train(args, dev, rank, world):
                   args.margin, args.homopolymer_cap) for b, e in enumerate(ents)]
         reward = np.array(rpool.map(group_rewards, tasks))
         t_rew = time.time() - t0 - t_roll
+        ok = ~np.isnan(reward).any(1)  # a group with an unscored candidate (neighbour does not align) is dropped
+        reward[~ok] = 0.0
         std = reward.std(1)
-        live = np.nonzero(std > 1e-6)[0]
+        live = np.nonzero(ok & (std > 1e-6))[0]
         adv = (reward - reward.mean(1, keepdims=True)) / np.maximum(std, args.std_floor)[:, None]
         seqs = [(b, j) for b in live for j in range(G)]
         n_bases = {bj: max(len(calls[bj[0] * G + bj[1]]), 1) for bj in seqs}
@@ -567,9 +614,11 @@ def train(args, dev, rank, world):
         sync(inf, model)
         step += 1
         keys = [("group", g) for g in ("human", "bact")] + [("pos", p) for p in POSITIONS]
-        per = [x for kind, v in keys for x in (sum(reward[b].sum() for b, e in enumerate(ents) if (group(e) if kind == "group" else e["pos"]) == v),
-                                               G * sum((group(e) if kind == "group" else e["pos"]) == v for e in ents))]
-        tot = torch.tensor([reward.sum(), reward.max(1).sum(), (reward < 0.9).sum(), reward.size, len(live), B,
+        sel = lambda kind, v, b, e: ok[b] and (group(e) if kind == "group" else e["pos"]) == v
+        per = [x for kind, v in keys for x in (sum(reward[b].sum() for b, e in enumerate(ents) if sel(kind, v, b, e)),
+                                               G * sum(sel(kind, v, b, e) for b, e in enumerate(ents)))]
+        r_ok = reward[ok]
+        tot = torch.tensor([r_ok.sum(), r_ok.max(1).sum() if len(r_ok) else 0.0, (r_ok < 0.9).sum(), r_ok.size, len(live), int(ok.sum()),
                             sum(ended), len(ended), stats["pg"], stats["ce"], stats["clip"], stats["ratio"], stats["n"]] + per,
                            device=dev, dtype=torch.float64)
         dist.all_reduce(tot)
