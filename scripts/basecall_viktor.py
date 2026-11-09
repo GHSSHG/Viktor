@@ -3,7 +3,8 @@
 Chunking is Dorado's variable-chunk-size path for transformer models (12288 samples, overlap 600, remainder as a short
 chunk, repeat-padded to 768 samples, padded frames dropped before decoding). Dorado stitches with the CRF moves; the
 decoder has none, so each overlap is resolved by aligning the end of chunk i with the start of chunk i+1 and cutting both
-at the middle of the aligned overlap (the same midpoint rule as dorado utils::stitch_chunks).
+at the middle of the aligned overlap (the same midpoint rule as dorado utils::stitch_chunks; overlap_cut has the
+fallbacks).
 
 Example:
   CUDA_VISIBLE_DEVICES=0 python -m scripts.basecall_viktor --model-dir MODEL --pod5 R.pod5 --read-ids ids.txt \
@@ -27,21 +28,36 @@ from viktor.chunking import chunk_read, repeat_pad, scale_record
 
 def overlap_cut(a, b, ov_frames, rate):
     """a, b: calls of adjacent chunks; ov_frames: encoder frames shared by them; rate: bases per frame.
-    Returns (cut_a, cut_b): keep a[:cut_a] + b[cut_b:]."""
+    Returns (cut_a, cut_b): keep a[:cut_a] + b[cut_b:]. The overlap is found by locating the head of b in the tail of a;
+    when that fails (the real overlap is shorter than expected: a chunk end called short), by the best suffix(a) ~
+    prefix(b) overlap. An (almost) empty chunk or no overlap at all: both kept whole (cutting at the expected middle
+    dropped ~25 bases at such junctions)."""
+    if len(a) < 8 or len(b) < 8:
+        return len(a), 0
     est = max(int(ov_frames * rate), 4)
     n_tail = min(len(a), int(est * 1.6) + 16)
     m = min(len(b), max(int(est * 0.5), 8))
-    ok = n_tail >= m >= 8
-    if ok:
+    if n_tail >= m:
         r = edlib.align(b[:m], a[len(a) - n_tail:], mode="HW", task="locations", k=m // 3)
-        ok = r["editDistance"] >= 0
-    if ok:
-        p = len(a) - n_tail + r["locations"][0][0]          # a[p] aligns with b[0]
-        q = a[p:]
-        r = edlib.align(q, b[:int(len(q) * 1.4) + 16], mode="SHW", task="path", k=max(len(q) // 3, 4))
-        ok = r["editDistance"] >= 0
-    if not ok:  # no clean overlap: cut both at the expected middle
-        return len(a) - est // 2, min(est - est // 2, len(b))
+        if r["editDistance"] >= 0:
+            cut = _mid_cut(a, b, len(a) - n_tail + r["locations"][0][0])  # a[p] aligns with b[0]
+            if cut:
+                return cut
+    best = None  # suffix(a) ~ prefix(b), at most 1 edit per 5 bases, score L - 4 x edits
+    for L in range(min(n_tail, len(b)), 9, -1):
+        ed = edlib.align(a[-L:], b[:L], mode="NW")["editDistance"]
+        if ed <= L // 5 and (best is None or L - 4 * ed > best[0]):
+            best = (L - 4 * ed, L)
+    cut = best and _mid_cut(a, b, len(a) - best[1])
+    return cut or (len(a), 0)
+
+
+def _mid_cut(a, b, p):
+    """a[p:] overlaps the head of b: cut both at the middle of their alignment (None: they do not align)."""
+    q = a[p:]
+    r = edlib.align(q, b[:int(len(q) * 1.4) + 16], mode="SHW", task="path", k=max(len(q) // 3, 4))
+    if r["editDistance"] < 0:
+        return None
     half, ia, ib = len(q) // 2, 0, 0
     for n, op in _cigar(r["cigar"]):
         for _ in range(n):
