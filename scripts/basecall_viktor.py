@@ -106,6 +106,68 @@ def stitch(calls, spans, n_samples, overlap):
     return "".join(out)
 
 
+@torch.no_grad()
+def base_frames(model, frames, flens, calls, layers=(2, 4), heads=(0, 4), mb=32):
+    """Encoder frame of every base of each call (frames: [sum(flens), d] as encode_chunks returns them): the call is
+    teacher-forced through the first layers and each token's frame is the argmax of the summed attention over the
+    real prefix of the heads trained on the forced alignment (train.py --align-*); bases interpolated between token
+    centres, made non-decreasing."""
+    dec, k = model.decoder, model.tokenizer.k
+    H, KV = model.cfg.n_heads, model.cfg.n_kv_heads
+    kv = [h * KV // H for h in heads]
+    offs = np.cumsum([0] + list(flens[:-1]))
+    out = []
+    for i in range(0, len(calls), mb):
+        idx = list(range(i, min(i + mb, len(calls))))
+        P = max(flens[j] for j in idx)
+        f = frames.new_zeros(len(idx), P, frames.shape[-1])
+        for r, j in enumerate(idx):
+            f[r, :flens[j]] = frames[offs[j]:offs[j] + flens[j]]
+        plens = torch.tensor([flens[j] for j in idx], device=f.device)
+        seqs = [calls[j][:len(calls[j]) // k * k] for j in idx]
+        tin = model.tokenizer.batch(seqs)[0].to(f.device)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            x, at = model.sequence(f, tin, plens)
+            x = x.to(torch.bfloat16)
+            cos, sin = dec.cos[:x.shape[1]], dec.sin[:x.shape[1]]
+            off = torch.arange(P, device=f.device)[None, None, None] >= plens[:, None, None, None]
+            att = 0
+            for li, layer in enumerate(dec.layers[:max(layers) + 1]):
+                if li in layers:
+                    q, kk = layer.attn.project(layer.attn_norm(x), cos, sin)[:2]
+                    qt = q[:, :, list(heads)].float().gather(1, at[..., None, None].expand(-1, -1, len(heads), q.shape[-1]))
+                    s = torch.einsum("bthd,bphd->bhtp", qt, kk[:, :P, kv].float()) * q.shape[-1] ** -0.5
+                    att = att + s.masked_fill(off, float("-inf")).softmax(-1).sum(1)
+                x = layer(x, cos, sin, li, None, slice(None), None, None)
+        tf = att.argmax(-1).float().cpu().numpy()
+        for r, j in enumerate(idx):
+            n = len(seqs[r]) // k
+            fb = np.interp(np.arange(len(calls[j])), np.arange(n) * k + (k - 1) / 2, tf[r, :n]) if n else \
+                np.zeros(len(calls[j]))
+            out.append(np.maximum.accumulate(fb))
+    return out
+
+
+def stitch_frames(calls, bframes, spans, stride):
+    """Dorado-style: cut adjacent chunks at the middle of their sample overlap, each keeping the bases whose frame lies
+    on its side (an (almost) empty neighbour: the other chunk is kept whole)."""
+    out, prev = [], 0
+    for i, s in enumerate(calls):
+        if i + 1 < len(calls):
+            b = calls[i + 1]
+            if len(s) < 8 or len(b) < 8:
+                ca, cb = len(s), 0
+            else:
+                mid = (spans[i][1] + spans[i + 1][0]) / 2
+                ca = int(np.searchsorted(bframes[i], (mid - spans[i][0]) / stride))
+                cb = int(np.searchsorted(bframes[i + 1], (mid - spans[i + 1][0]) / stride))
+            out.append(s[prev:ca])
+            prev = cb
+        else:
+            out.append(s[prev:])
+    return "".join(out)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("snap", help="snap_*.pt / last.pt checkpoint")
@@ -125,6 +187,10 @@ def main():
                     help="shorten runs of >= N identical bases in every chunk call to 20 before stitching (0: off)")
     ap.add_argument("--timing", help="write one TSV row per decoded batch: size, encode s, decode s, call lengths")
     ap.add_argument("--dump-chunks", help="also write every chunk call (before stitching) to this FASTA")
+    ap.add_argument("--stitch", choices=["align", "frames"], default="align",
+                    help="align: overlap_cut (sequence alignment of the overlap); frames: Dorado-style cut at the overlap's "
+                         "sample midpoint, base frames from the alignment-supervised attention heads (homopolymer cap "
+                         "applied to the stitched read)")
     args = ap.parse_args()
 
     dev = torch.device("cuda")
@@ -160,7 +226,9 @@ def main():
     items.sort(key=lambda it: -len(it[4]))
     print(f"{len(reads)} reads, {len(items)} chunks", flush=True)
 
-    calls, t0, tim = {}, time.time(), []
+    fr = args.stitch == "frames"
+    cap = args.homopolymer_cap and not fr  # frames: capped after stitching (the base frames index the raw call)
+    calls, bfr, t0, tim, t_fr = {}, {}, time.time(), [], 0.0
     with torch.no_grad():
         for i in range(0, len(items), args.batch):
             g = items[i:i + args.batch]
@@ -175,10 +243,15 @@ def main():
             t3 = time.time()
             for it, t in zip(g[:n], toks):
                 calls[(it[0], it[1])] = model.tokenizer.decode(t)
-                if args.homopolymer_cap:
+                if cap:
                     calls[(it[0], it[1])] = cap_homopolymers(calls[(it[0], it[1])], args.homopolymer_cap)
+            if fr:
+                for it, bf in zip(g[:n], base_frames(model, frames, list(flens)[:n], [calls[(it[0], it[1])] for it in g[:n]])):
+                    bfr[(it[0], it[1])] = bf
+                torch.cuda.synchronize()
+                t_fr += time.time() - t3
             tim.append((n, t2 - t1, t3 - t2, [len(calls[(it[0], it[1])]) for it in g[:n]]))
-    print(f"decoded in {time.time() - t0:.0f} s", flush=True)
+    print(f"decoded in {time.time() - t0:.0f} s" + (f" (base frames {t_fr:.0f} s)" if fr else ""), flush=True)
     if args.timing:
         with open(args.timing, "w") as f:
             for n, te, td, lens in tim:
@@ -191,7 +264,13 @@ def main():
                 f.write(f">{rid}_{ci}_{a}_{b}_{reads[rid][0]}\n{seq}\n")
     with open(args.out, "w") as f:
         for rid, (n, spans) in reads.items():
-            seq = stitch([calls[(rid, c)] for c in range(len(spans))], spans, n, overlap)
+            if fr:
+                seq = stitch_frames([calls[(rid, c)] for c in range(len(spans))], [bfr[(rid, c)] for c in range(len(spans))],
+                                    spans, enc.stride)
+                if args.homopolymer_cap:
+                    seq = cap_homopolymers(seq, args.homopolymer_cap)
+            else:
+                seq = stitch([calls[(rid, c)] for c in range(len(spans))], spans, n, overlap)
             if args.trim_adapter:
                 seq = trim_adapter(seq)
             if seq:
