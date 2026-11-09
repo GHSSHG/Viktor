@@ -29,7 +29,8 @@ train  (torchrun) GSPO as scripts/gspo.py train (sequence ratio per base, clip -
        --tok-weight > 0 plus a token credit term: in each group a candidate is right at a truth position when it has
        no error within --tok-window bases, the baseline there is the share of candidates right, every own base gets
        (right - baseline) at its truth base and a token the mean over its own bases; loss = PPO-clipped token ratio
-       (--tok-eps) x credit, summed over the credited tokens / the call's tokens, x --tok-weight. Entries
+       (--tok-eps) x credit, summed over the credited tokens / the call's tokens, x --tok-weight; --tok-ref greedy:
+       credit only within --tok-window of the errors of the chunk's greedy call (decoded with the neighbours). Entries
        are drawn by class (--mix): first a mining pass scores the greedy call of every train entry under --init
        (readpool/mine.pt, reused while --init is unchanged) and splits human entries into low / mid / perfect. Evaluation
        (rank 0, every --eval-every steps and at the start): the read-level reward of greedy calls of the eval entries
@@ -205,15 +206,18 @@ def entry_reward(calls, e, margin, cap, detail=False):
     return r, d, off if calls[e["t"]] == raw else None
 
 
-def token_credit(details, k, win):
+def token_credit(details, k, win, focus=None):
     """Per-position credit within a group. details: per candidate (read_reward detail, raw offset) or None. A candidate
     is right at truth position p when it has no error within +- win of p; the baseline at p is the share of the
     candidates covering p that are right there. Each own base gets (right - baseline) at its truth base (an extra base:
-    the truth base before it); a token gets the mean over its own bases -> per candidate {token index: credit}."""
+    the truth base before it); a token gets the mean over its own bases -> per candidate {token index: credit}.
+    focus (truth positions, e.g. the greedy call's errors): credit only within +- win of them, else 0; also returns
+    (focus positions, those with at least one right candidate)."""
     use = [g for g, x in enumerate(details) if x is not None and x[0] is not None and x[1] is not None]
     out = [{} for _ in details]
-    if len(use) < 2:
-        return out
+    nofix = (out, (0, 0)) if focus is not None else out
+    if len(use) < 2 or (focus is not None and not len(focus)):
+        return nofix
     maps = {}
     for g in use:
         (a, cols, pos), off = details[g]
@@ -226,41 +230,58 @@ def token_credit(details, k, win):
         if js:  # truth span of the candidate (every truth base of it is a column)
             maps[g] = (np.array(own_i, int), np.array(tp, int), a + np.array(pos, int), off, a + js[0], a + js[-1] + 1)
     if len(maps) < 2:
-        return out
+        return nofix
     use = list(maps)
     lo, hi = min(m[4] for m in maps.values()), max(m[5] for m in maps.values())
     n = hi - lo
+    def near(pos):  # positions within +- win of any of pos
+        x = np.asarray(pos, int) - lo + win
+        x = x[(x >= 0) & (x < n + 2 * win)]
+        return np.convolve(np.bincount(x, minlength=n + 2 * win), np.ones(2 * win + 1), "same")[win:win + n] > 0
     right = np.zeros((len(use), n)); cover = np.zeros((len(use), n), bool)
     for r_, g in enumerate(use):
         _, _, ep, _, s0, s1 = maps[g]
         cover[r_, s0 - lo:s1 - lo] = True
-        bad = np.zeros(n + 2 * win)
-        np.add.at(bad, ep - lo + win, 1)
-        right[r_] = np.convolve(bad, np.ones(2 * win + 1), "same")[win:win + n] == 0
+        right[r_] = ~near(ep)
     base = (right * cover).sum(0) / np.maximum(cover.sum(0), 1)
+    mask = np.ones(n, bool)
+    if focus is not None:
+        mask = near(focus)
+        f = np.asarray(focus, int) - lo
+        f = f[(f >= 0) & (f < n)]
+        fixable = (int(len(f)), int(((right * cover)[:, f].sum(0) > 0).sum()))
     for r_, g in enumerate(use):
         own_i, tp, _, off, _, _ = maps[g]
         if not len(tp):
             continue
-        c = right[r_, tp - lo] - base[tp - lo]
+        c = (right[r_, tp - lo] - base[tp - lo]) * mask[tp - lo]
         tok = (off + own_i) // k
         s = np.bincount(tok, c); m = np.bincount(tok)
         out[g] = {int(t): float(s[t] / m[t]) for t in np.nonzero((m > 0) & (np.abs(s) > 1e-9))[0]}
-    return out
+    return (out, fixable) if focus is not None else out
 
 
 def group_rewards(task):
-    """(candidate calls of chunk t, the entry's neighbour calls by chunk index, entry, margin, cap[, (k, win)]) ->
-    rewards, or with (k, win): (rewards, per candidate token credit)."""
+    """(candidate calls of chunk t, the entry's neighbour calls by chunk index, entry, margin, cap[, (k, win)[, greedy
+    call of chunk t]]) -> rewards, or with (k, win): (rewards, per candidate token credit, (greedy errors, of them
+    fixable)); with the greedy call the credit is limited to its errors (token_credit focus)."""
     cands, nb, e, margin, cap = task[:5]
     calls = lambda c: [c if i == e["t"] else nb[i] for i in range(len(e["spans"]))]
     if len(task) < 6 or task[5] is None:
         return [entry_reward(calls(c), e, margin, cap) for c in cands]
     res = [entry_reward(calls(c), e, margin, cap, detail=True) for c in cands]
     rewards = [r for r, _, _ in res]
+    none = [{} for _ in cands]
     if any(np.isnan(rewards)):
-        return rewards, [{} for _ in cands]
-    return rewards, token_credit([(d, off) for _, d, off in res], *task[5])
+        return rewards, none, (0, 0)
+    details = [(d, off) for _, d, off in res]
+    if len(task) < 7 or task[6] is None:
+        return rewards, token_credit(details, *task[5]), (0, 0)
+    gr, gd, _ = entry_reward(calls(task[6]), e, margin, cap, detail=True)
+    if np.isnan(gr):
+        return rewards, none, (0, 0)
+    credit, fixable = token_credit(details, *task[5], focus=gd[0] + np.array(gd[2], int))
+    return rewards, credit, fixable
 
 
 # ------------------------------------------------------------------------------------------------------------ prep
@@ -614,19 +635,23 @@ def train(args, dev, rank, world):
         sig, rows = pool.chunks(pick)
         frames, plens = encode(model, sig, dev)
         tgt = torch.tensor([r[e["t"]] for r, e in zip(rows, ents)], device=dev)
+        credit_args = (model.tokenizer.k, args.tok_window) if args.tok_weight > 0 else None
+        ref = credit_args is not None and args.tok_ref == "greedy"
         nb = [j for r, e in zip(rows, ents) for i, j in enumerate(r) if i != e["t"]]   # neighbours: greedy, shared by the group
-        nb_calls = dict(zip(nb, run(greedy, frames[nb], plens[nb], model.tokenizer)[0])) if nb else {}
+        gl = nb + (tgt.tolist() if ref else [])  # --tok-ref greedy: also the greedy call of chunk t
+        nb_calls = dict(zip(gl, run(greedy, frames[gl], plens[gl], model.tokenizer)[0])) if gl else {}
         tf, tp = frames[tgt], plens[tgt]
         calls, ended = decode(roll, tf.repeat_interleave(G, 0), tp.repeat_interleave(G), model.tokenizer)
         t_roll = time.time() - t0
-        credit_args = (model.tokenizer.k, args.tok_window) if args.tok_weight > 0 else None
         tasks = [(calls[b * G:(b + 1) * G], {i: nb_calls[c] for i, c in enumerate(rows[b]) if i != e["t"]}, e,
-                  args.margin, args.homopolymer_cap, credit_args) for b, e in enumerate(ents)]
+                  args.margin, args.homopolymer_cap, credit_args, nb_calls[rows[b][e["t"]]] if ref else None)
+                 for b, e in enumerate(ents)]
         res = rpool.map(group_rewards, tasks)
         if credit_args:
-            reward, credit = np.array([r for r, _ in res]), [c for _, c in res]
+            reward, credit = np.array([x[0] for x in res]), [x[1] for x in res]
+            g_err, g_fix = sum(x[2][0] for x in res), sum(x[2][1] for x in res)
         else:
-            reward, credit = np.array(res), [[{}] * G for _ in res]
+            reward, credit, g_err, g_fix = np.array(res), [[{}] * G for _ in res], 0, 0
         t_rew = time.time() - t0 - t_roll
         ok = ~np.isnan(reward).any(1)  # a group with an unscored candidate (neighbour does not align) is dropped
         reward[~ok] = 0.0
@@ -708,18 +733,18 @@ def train(args, dev, rank, world):
         r_ok = reward[ok]
         tot = torch.tensor([r_ok.sum(), r_ok.max(1).sum() if len(r_ok) else 0.0, (r_ok < 0.9).sum(), r_ok.size, len(live), int(ok.sum()),
                             sum(ended), len(ended), stats["pg"], stats["ce"], stats["clip"], stats["ratio"], stats["n"],
-                            stats["tok"], stats["tok_n"], stats["tok_clip"], stats["tokens"], stats["tok_abs"]] + per,
+                            stats["tok"], stats["tok_n"], stats["tok_clip"], stats["tokens"], stats["tok_abs"], g_err, g_fix] + per,
                            device=dev, dtype=torch.float64)
         dist.all_reduce(tot)
-        r_sum, best, der, n_r, n_live, n_win, n_end, n_calls, pg, ce, clip, ratio, n, tok, tok_n, tok_clip, tokens, tok_abs = tot.tolist()[:18]
-        per = tot.tolist()[18:]
+        r_sum, best, der, n_r, n_live, n_win, n_end, n_calls, pg, ce, clip, ratio, n, tok, tok_n, tok_clip, tokens, tok_abs, g_err, g_fix = tot.tolist()[:20]
+        per = tot.tolist()[20:]
         n = max(n, 1)
         rec = {f"reward_{kind}/{v}": per[2 * i] / per[2 * i + 1] for i, (kind, v) in enumerate(keys) if per[2 * i + 1]}
         rec |= {"reward/mean": r_sum / n_r, "reward/best_of_group": best / n_win, "reward/derail": der / n_r,
                 "groups_live": n_live / n_win, "ended": n_end / n_calls, "pg": pg / n, "ce": ce / (args.sft_per_step * world),
                 "clip_frac": clip / n, "ratio_dev": ratio / n, "grad_norm": float(gnorm), "lr": lr,
                 "tok/loss": tok / n, "tok/credited_frac": tok_n / max(tokens, 1), "tok/clip_frac": tok_clip / max(tok_n, 1),
-                "tok/mean_abs_credit": tok_abs / max(tok_n, 1),
+                "tok/mean_abs_credit": tok_abs / max(tok_n, 1), "tok/greedy_err_fixable": g_fix / max(g_err, 1),
                 "s_rollout": t_roll, "s_reward": t_rew, "s_per_step": time.time() - t0 - paused, "paused_s": paused,
                 "gpu/temp": torch.cuda.temperature(dev)}
         if step % args.eval_every == 0 or step == args.steps:
@@ -730,7 +755,7 @@ def train(args, dev, rank, world):
             if step % 10 == 0 or step <= 10:
                 print(f"step {step} reward {rec['reward/mean']:.4f} live {rec['groups_live']:.2f} pg {rec['pg']:.4f} "
                       f"ce {rec['ce']:.4f} clip {rec['clip_frac']:.3f} ratio {rec['ratio_dev']:.5f} "
-                      f"tok {rec['tok/loss']:.5f} credited {rec['tok/credited_frac']:.4f} |c| {rec['tok/mean_abs_credit']:.3f} tok_clip {rec['tok/clip_frac']:.3f} "
+                      f"tok {rec['tok/loss']:.5f} credited {rec['tok/credited_frac']:.4f} |c| {rec['tok/mean_abs_credit']:.3f} fixable {rec['tok/greedy_err_fixable']:.2f} tok_clip {rec['tok/clip_frac']:.3f} "
                       f"rollout {t_roll:.1f} s reward {t_rew:.1f} s {rec['s_per_step']:.1f} s/step", flush=True)
     rpool.close()
     if rank == 0:
@@ -788,6 +813,8 @@ def main():
     ap.add_argument("--std-floor", type=float, default=0.003, help="advantage: group reward std floor")
     ap.add_argument("--tok-weight", type=float, default=0.0, help="token credit term weight (0: sequence-level only)")
     ap.add_argument("--tok-eps", type=float, default=0.2, help="token credit term: token-ratio clip")
+    ap.add_argument("--tok-ref", choices=("group", "greedy"), default="group", help="token credit at every position "
+                    "(group) or only near the errors of the greedy call of the chunk (greedy)")
     ap.add_argument("--tok-window", type=int, default=2, help="token credit: a candidate is right at a truth position "
                                                                 "when it has no error within this many bases")
     ap.add_argument("--updates", type=int, default=2, help="optimiser steps per rollout")
