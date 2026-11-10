@@ -21,6 +21,27 @@ import torch.nn.functional as F
 
 from .encoder import apply_rope, rope_tables
 
+try:
+    from flash_attn import flash_attn_varlen_func
+except ImportError:
+    flash_attn_varlen_func = None
+
+
+def _flash_window(q, k, v, valid, window):
+    """Split each row into real and padding sequences without dynamic packing.
+
+    Separate varlen segments prevent real queries from seeing padding. Keeping
+    padding as its own (possibly empty) segment avoids gathers and graph breaks;
+    its outputs are discarded by the encoder's stage mask.
+    """
+    B, T, H, D = q.shape
+    lengths = valid.sum(1, dtype=torch.int32)
+    starts = torch.arange(B, device=q.device, dtype=torch.int32) * T
+    cu = torch.cat((torch.stack((starts, starts + lengths), dim=1).flatten(),
+                    torch.full((1,), B * T, device=q.device, dtype=torch.int32)))
+    flat = [x.reshape(B * T, H, D) for x in (q, k, v)]
+    return flash_attn_varlen_func(*flat, cu, cu, T, T, window_size=(window, window)).view(B, T, H * D)
+
 
 @dataclass
 class FastEncoderConfig:
@@ -74,12 +95,20 @@ class Layer(nn.Module):
         self.gate_up = nn.Linear(d, 2 * _ffn(d), bias=False)
         self.down = nn.Linear(_ffn(d), d, bias=False)
 
-    def forward(self, x, cos, sin, mask):
+    def forward(self, x, cos, sin, valid, window):
         B, T, _ = x.shape
         q, k, v = self.qkv(self.attn_norm(x)).view(B, T, 3, self.h, self.hd).unbind(2)
         q, k = apply_rope(self.q_norm(q), cos, sin), apply_rope(self.k_norm(k), cos, sin)
-        q, k, v = (t.to(v.dtype).transpose(1, 2) for t in (q, k, v))
-        o = F.scaled_dot_product_attention(q, k, v, attn_mask=mask).transpose(1, 2).reshape(B, T, -1)
+        q, k = q.to(v.dtype), k.to(v.dtype)
+        if flash_attn_varlen_func is not None and q.is_cuda and q.dtype in (torch.float16, torch.bfloat16):
+            o = _flash_window(q, k, v, valid, window)
+        else:
+            t = torch.arange(T, device=x.device)
+            band = (t[None, :] - t[:, None]).abs() <= window
+            mask = (band[None] & (valid[:, None, :] | ~valid[:, :, None]))[:, None]
+            o = F.scaled_dot_product_attention(
+                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+                attn_mask=mask).transpose(1, 2).reshape(B, T, -1)
         x = x + self.out(o)
         gate, up = self.gate_up(self.mlp_norm(x)).chunk(2, -1)
         return x + self.down(F.silu(gate) * up)
@@ -150,12 +179,8 @@ class FastEncoder(nn.Module):
                 st *= 2
             T = h.shape[1]
             v = valid(T, st)
-            t = torch.arange(T, device=x.device)
-            band = (t[None, :] - t[:, None]).abs() <= stage.window
-            # a padding query keeps its band (no all-masked rows); real queries see real keys only
-            mask = (band[None] & (v[:, None, :] | ~v[:, :, None]))[:, None]
             for layer in stage.layers:
-                h = layer(h, self.cos[:T], self.sin[:T], mask)
+                h = layer(h, self.cos[:T], self.sin[:T], v, stage.window)
             h = h * v[..., None].to(h.dtype)
             if i == 0:
                 mid = (h, v.sum(1))
