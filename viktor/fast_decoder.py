@@ -30,7 +30,7 @@ class FastDecoder:
             raise ValueError(f"unknown decode attention backend: {attention_backend}")
         self.attention_backend = attention_backend
 
-    def _layers(self, x, pos, seq, cache: KVCache, attend, return_kv, last_indices=None):
+    def _layers(self, x, pos, seq, cache: KVCache, attend, return_kv, last_indices=None, rope_pos=None):
         """x [n, d] residual stream (modified in place). Returns the final-normed hidden [n, d]."""
         cfg, layers = self.cfg, self.dec.layers
         h = add_rmsnorm(x, layers[0].attn_norm.weight, cfg.norm_eps)
@@ -39,7 +39,7 @@ class FastDecoder:
             qkv = F.linear(h, a.qkv_proj.weight)
             r = qkv_rope_cache(qkv, a.q_norm.weight, a.k_norm.weight, self.dec.cos, self.dec.sin, pos, seq,
                                cache.k[i], cache.v[i], cfg.norm_eps, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim,
-                               return_kv=return_kv)
+                               return_kv=return_kv, rope_pos=rope_pos)
             if last_indices is not None and i == len(layers) - 1:
                 # The final signal outputs have no consumers. Keep all K/V, but
                 # only finish the BOS residual stream and its attention queries.
@@ -54,7 +54,8 @@ class FastDecoder:
             h = add_rmsnorm(x, w_next, cfg.norm_eps, delta=m)
         return h
 
-    def prefill(self, x, pos, seq, cu_seqlens, max_seqlen, cache: KVCache, last_indices=None, cu_queries=None):
+    def prefill(self, x, pos, seq, cu_seqlens, max_seqlen, cache: KVCache, last_indices=None, cu_queries=None,
+                rope_pos=None):
         """x [n, d] packed prefix embeddings of several sequences; pos/seq [n] int32; cu_seqlens [b+1] int32.
         Fills the cache rows of those sequences. Returns hidden [n, d], or [b, d] at the final
         position of each sequence when last_indices and cu_queries are provided together."""
@@ -65,9 +66,9 @@ class FastDecoder:
                 # BOS is the last position and may attend to the entire prefix.
                 return flash_attn_varlen_func(q, k, v, cu_queries, cu_seqlens, 1, max_seqlen, causal=False)
             return flash_attn_varlen_func(q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, causal=True)
-        return self._layers(x, pos, seq, cache, attend, return_kv=True, last_indices=last_indices)
+        return self._layers(x, pos, seq, cache, attend, return_kv=True, last_indices=last_indices, rope_pos=rope_pos)
 
-    def decode(self, x, pos, seq, cache_seqlens, cache: KVCache):
+    def decode(self, x, pos, seq, cache_seqlens, cache: KVCache, rope_pos=None):
         """One token per sequence: x [B, d], pos/seq [B] int32, cache_seqlens = pos + 1 (int32)."""
         def attend(i, q):
             if self.attention_backend == "triton":
@@ -77,4 +78,4 @@ class FastDecoder:
             # identity cache_batch_idx with num_splits=1 selects the split-KV decode kernel.
             return flash_attn_with_kvcache(q[:, None], cache.k[i], cache.v[i], cache_seqlens=cache_seqlens,
                                           cache_batch_idx=seq, num_splits=1)[:, 0]
-        return self._layers(x, pos, seq, cache, attend, return_kv=False)
+        return self._layers(x, pos, seq, cache, attend, return_kv=False, rope_pos=rope_pos)

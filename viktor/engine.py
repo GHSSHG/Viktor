@@ -35,9 +35,8 @@ class DecodeEngine:
         dev = self.dec.lm_head.weight.device
         self.dtype = self.dec.lm_head.weight.dtype
         self.pos_scale = getattr(model, "pos_scale", 1)
-        if backend == "auto":  # the fused kernels take RoPE positions = cache positions (pos_scale 1 only)
-            backend = "triton" if dev.type == "cuda" and _triton_available() and self.pos_scale == 1 else "torch"
-        assert backend == "torch" or self.pos_scale == 1
+        if backend == "auto":
+            backend = "triton" if dev.type == "cuda" and _triton_available() else "torch"
         self.backend = backend
         if backend == "triton":
             from .fast_decoder import FastDecoder
@@ -53,6 +52,7 @@ class DecodeEngine:
         self.pos = torch.zeros(batch_size, dtype=torch.long, device=dev)
         self.rope_off = torch.zeros(batch_size, dtype=torch.long, device=dev)  # RoPE position - cache position
         self.pos32 = torch.zeros(batch_size, dtype=torch.int32, device=dev)
+        self.rpos32 = torch.zeros(batch_size, dtype=torch.int32, device=dev)
         self.seqlens = torch.zeros(batch_size, dtype=torch.int32, device=dev)
         self.rows = torch.arange(batch_size, dtype=torch.int32, device=dev)
         self.step_idx = torch.zeros(1, dtype=torch.long, device=dev)
@@ -80,7 +80,11 @@ class DecodeEngine:
         if self.backend == "triton":
             self.pos32.copy_(self.pos)
             self.seqlens.copy_(self.pos + 1)
-            h = self.fast.decode(x, self.pos32, self.rows, self.seqlens, self.cache)
+            rp = None
+            if self.pos_scale != 1:
+                self.rpos32.copy_(self.pos + self.rope_off)
+                rp = self.rpos32
+            h = self.fast.decode(x, self.pos32, self.rows, self.seqlens, self.cache, rope_pos=rp)
         else:
             self.seqlens.copy_(self.pos)
             h = self.dec(x[:, None], cache=self.cache, pos=self.pos, seqlens=self.seqlens,
@@ -132,13 +136,14 @@ class DecodeEngine:
             seq = torch.repeat_interleave(torch.arange(row0, row0 + n, device=dev, dtype=torch.int32),
                                           L + 1, output_size=total)
             cuq = torch.arange(n + 1, device=dev, dtype=torch.int32)
-            entry = key, (frame_idx, last, pos, seq, cu, cuq, total, max(lens) + 1)
+            rpos = None if self.pos_scale == 1 else pos * self.pos_scale  # frame j -> s j, BOS (index n) -> s n
+            entry = key, (frame_idx, last, pos, seq, cu, cuq, total, max(lens) + 1, rpos)
             self._prefill_plans[row0] = entry
-        frame_idx, last, pos, seq, cu, cuq, total, max_len = entry[1]
+        frame_idx, last, pos, seq, cu, cuq, total, max_len, rpos = entry[1]
         x = torch.empty(total, prefix.shape[1], dtype=self.dtype, device=dev)
         x[frame_idx] = prefix
         x[last] = self.dec.embed(self.bos).to(self.dtype)
-        return self.fast.prefill(x, pos, seq, cu, max_len, self.cache, last_indices=last, cu_queries=cuq)
+        return self.fast.prefill(x, pos, seq, cu, max_len, self.cache, last_indices=last, cu_queries=cuq, rope_pos=rpos)
 
     @torch.no_grad()
     def prefill(self, frames, frame_lens):

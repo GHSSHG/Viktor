@@ -12,7 +12,7 @@ default part1; WEIGHT the share of training windows drawn from it, default 1).
 Schedule: WSD (linear warmup, constant, 1 - sqrt decay to 0 over the last --decay-frac of the steps). With
 --decay-start the decay instead starts at that step and runs --decay-steps; training stops at its end, and a
 resumable copy of the state just before the decay is kept as OUT/predecay_<step>.pt. Without it (and with --init)
-the learning rate stays at --lr until --max-steps, so the decay can be scheduled later by resuming with
+(and with --init or --encoder-arch fast) the learning rate stays at --lr until --max-steps, so the decay can be scheduled later by resuming with
 --decay-start. --init starts a new run (own OUT, own wandb run) from another run's resumable checkpoint
 (projector, decoder, optimizer state, step).
 --train-encoder: the encoder is trained too (full fine-tuning): PyTorch layers instead of koi, fp32 weights with bf16
@@ -359,8 +359,8 @@ def main():
     decay_start = args.decay_start
     if decay_start is not None:
         total = decay_start + args.decay_steps
-    elif args.init:  # constant learning rate until --max-steps
-        assert args.max_steps, "--init needs --decay-start or --max-steps"
+    elif args.init or args.encoder_arch == "fast":  # constant learning rate until --max-steps
+        assert args.max_steps, "--init / --encoder-arch fast need --decay-start or --max-steps"
         total = decay_start = args.max_steps
     stop = min(total, args.max_steps or total)
 

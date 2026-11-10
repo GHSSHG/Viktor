@@ -50,7 +50,7 @@ def _norm_rope(x1, x2, w_ptr, c, s, eps, D: tl.constexpr, HALF: tl.constexpr, OU
 
 
 @triton.jit
-def _qkv_rope_cache_kernel(qkv_ptr, qw_ptr, kw_ptr, cos_ptr, sin_ptr, pos_ptr, seq_ptr,
+def _qkv_rope_cache_kernel(qkv_ptr, qw_ptr, kw_ptr, cos_ptr, sin_ptr, pos_ptr, rpos_ptr, seq_ptr,
                            q_ptr, kc_ptr, vc_ptr, ko_ptr, vo_ptr, stride_cb, stride_cs, eps,
                            H: tl.constexpr, HKV: tl.constexpr, D: tl.constexpr, WRITE_KV: tl.constexpr):
     t = tl.program_id(0).to(tl.int64)
@@ -59,8 +59,9 @@ def _qkv_rope_cache_kernel(qkv_ptr, qw_ptr, kw_ptr, cos_ptr, sin_ptr, pos_ptr, s
     d = tl.arange(0, HALF)
     pos = tl.load(pos_ptr + t).to(tl.int64)
     seq = tl.load(seq_ptr + t).to(tl.int64)
-    c = tl.load(cos_ptr + pos * HALF + d)
-    s = tl.load(sin_ptr + pos * HALF + d)
+    rpos = tl.load(rpos_ptr + t).to(tl.int64)
+    c = tl.load(cos_ptr + rpos * HALF + d)
+    s = tl.load(sin_ptr + rpos * HALF + d)
     row = qkv_ptr + t * (H + 2 * HKV) * D
 
     hq = tl.arange(0, H)
@@ -91,16 +92,17 @@ def _qkv_rope_cache_kernel(qkv_ptr, qw_ptr, kw_ptr, cos_ptr, sin_ptr, pos_ptr, s
 
 
 def qkv_rope_cache(qkv, q_norm_w, k_norm_w, cos, sin, pos, seq, k_cache, v_cache, eps, n_heads, n_kv_heads,
-                   head_dim, return_kv=False):
+                   head_dim, return_kv=False, rope_pos=None):
     """qkv [n, (H + 2 Hkv) * D]; pos/seq [n] position and cache row of each token; cos/sin [S, D/2] fp32;
-    k_cache/v_cache [B, S, Hkv, D] (one layer). Returns q [n, H, D] (and packed k, v [n, Hkv, D])."""
+    k_cache/v_cache [B, S, Hkv, D] (one layer). rope_pos [n]: RoPE positions when they differ from pos.
+    Returns q [n, H, D] (and packed k, v [n, Hkv, D])."""
     n = qkv.shape[0]
     q = torch.empty(n, n_heads, head_dim, dtype=qkv.dtype, device=qkv.device)
     k = v = q
     if return_kv:
         k = torch.empty(n, n_kv_heads, head_dim, dtype=qkv.dtype, device=qkv.device)
         v = torch.empty_like(k)
-    _qkv_rope_cache_kernel[(n,)](qkv, q_norm_w, k_norm_w, cos, sin, pos, seq, q, k_cache, v_cache, k, v,
+    _qkv_rope_cache_kernel[(n,)](qkv, q_norm_w, k_norm_w, cos, sin, pos, pos if rope_pos is None else rope_pos, seq, q, k_cache, v_cache, k, v,
                                  k_cache.stride(0), k_cache.stride(1), eps, H=n_heads, HKV=n_kv_heads,
                                  D=head_dim, WRITE_KV=return_kv, num_warps=2)
     return (q, k, v) if return_kv else q
