@@ -170,8 +170,9 @@ def ctc_targets(seqs, pad_to=1):
     lut = torch.zeros(256, dtype=torch.long)
     for i, c in enumerate(b"ACGT"):
         lut[c] = i + 1
-    L = -(-max(len(s) for s in seqs) // pad_to) * pad_to
+    L = max(-(-max(len(s) for s in seqs) // pad_to) * pad_to, 1)
     t = torch.zeros(len(seqs), L, dtype=torch.long)
     for b, s in enumerate(seqs):
-        t[b, :len(s)] = lut[torch.frombuffer(bytearray(s.encode()), dtype=torch.uint8).long()]
+        if s:  # an empty label (no bases in the window) stays all padding
+            t[b, :len(s)] = lut[torch.frombuffer(bytearray(s.encode()), dtype=torch.uint8).long()]
     return t, torch.tensor([len(s) for s in seqs])
