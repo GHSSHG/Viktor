@@ -113,6 +113,17 @@ def named_groups(module, name, weight_decay):
     return [{"params": dec, "weight_decay": weight_decay, "name": name}, {"params": rest, "weight_decay": 0.0, "name": name}]
 
 
+def unfreeze_decoder(model, step_fn, wrap, compiled):
+    """Rebuild the training graph when its set of differentiable parameters changes."""
+    model.decoder.requires_grad_(True)
+    del step_fn
+    if compiled:
+        # Re-wrapping DDP alone can reuse the frozen AOTAutograd graph and return
+        # zero decoder gradients while AdamW still applies weight decay.
+        torch._dynamo.reset()
+    return wrap()
+
+
 def wsd(step, total, peak, warmup, decay_frac, decay_start=None):
     """decay_start None: decay over the last decay_frac of total; else from decay_start over total - decay_start."""
     if decay_start is None:
@@ -448,6 +459,7 @@ def main():
         return ddp if args.no_compile else torch.compile(ddp, dynamic=False)  # one graph per --pad-to length
 
     step_fn = wrap()
+    check_decoder_grad = fast and not frozen
 
     seed = args.seed * 1000 + step
     parts = [WindowDataset(d, "train", encoder.mean, encoder.stdev, rank, world, seed, *part_paths(part),
@@ -505,8 +517,8 @@ def main():
             shutil.copyfile(ckpt, os.path.join(args.out, f"predecay_{step}.pt"))
         if fast and frozen and step >= args.freeze_decoder_steps:
             frozen = False
-            model.decoder.requires_grad_(True)
-            step_fn = wrap()
+            step_fn = unfreeze_decoder(model, step_fn, wrap, compiled=not args.no_compile)
+            check_decoder_grad = True
             if rank == 0:
                 print(f"step {step}: decoder unfrozen", flush=True)
         lr = wsd(step, total, args.lr, args.warmup, args.decay_frac, decay_start)
@@ -541,6 +553,22 @@ def main():
             ctc = ctc48 = torch.zeros_like(ce)
         opt.zero_grad(set_to_none=True)
         loss.backward()
+        decoder_before = None
+        if fast and not frozen:
+            decoder_grads = [
+                torch.linalg.vector_norm(p.grad.detach().float())
+                for p in model.decoder.parameters() if p.grad is not None]
+            decoder_gnorm = torch.linalg.vector_norm(torch.stack(decoder_grads)) if decoder_grads else loss.new_zeros(())
+            if check_decoder_grad:
+                good = (torch.isfinite(decoder_gnorm) & (decoder_gnorm > 0)).to(torch.int32)
+                dist.all_reduce(good, op=dist.ReduceOp.MIN)
+                if not good.item():
+                    raise RuntimeError("Decoder has zero or non-finite gradients after unfreezing/resuming; "
+                                       "refusing an AdamW step that would only decay its weights")
+                if rank == 0:
+                    print(f"step {step}: decoder gradient verified, norm {float(decoder_gnorm):.6g}", flush=True)
+                decoder_before = model.decoder.embed.weight.detach().clone()
+                check_decoder_grad = False
         if fast:  # inside DDP: gradients already averaged; encoder (+ CTC head) clipped on its own
             enc_gnorm = nn.utils.clip_grad_norm_(list(encoder.parameters()), args.clip)
             gnorm = nn.utils.clip_grad_norm_([p for p in list(model.projector.parameters()) + list(model.decoder.parameters())
@@ -556,6 +584,18 @@ def main():
                 p.grad = gp.view_as(p)
             enc_gnorm = nn.utils.clip_grad_norm_(ps, args.clip)
         opt.step()
+        if decoder_before is not None:
+            # Embeddings have no weight decay: this must be a real learning update.
+            update = (model.decoder.embed.weight.detach() - decoder_before).abs().max()
+            state = opt.state[model.decoder.embed.weight]
+            good = (torch.isfinite(update) & (update > 0)
+                    & (state["exp_avg"].abs().max() > 0)
+                    & (state["exp_avg_sq"].max() > 0)).to(torch.int32)
+            dist.all_reduce(good, op=dist.ReduceOp.MIN)
+            if not good.item():
+                raise RuntimeError("Decoder gradient check passed but Adam did not update its embedding")
+            if rank == 0:
+                print(f"step {step}: decoder Adam update verified, embedding max change {float(update):.6g}", flush=True)
         step += 1
         acc += torch.stack([loss.detach(), ce.detach(), align.detach(), correct.float(), scored.float(),
                             torch.tensor(float(sum(map(len, seqs))), device=dev), ctc.detach(), ctc48.detach()])
@@ -574,6 +614,8 @@ def main():
                     rec |= {"train/ctc": float(acc[6]) / (n * world), "train/ctc48": float(acc[7]) / (n * world),
                             "encoder_grad_norm": float(enc_gnorm),
                             "decoder_lr": next(g["lr"] for g in opt.param_groups if g["name"] == "decoder")}
+                    if not frozen:
+                        rec["decoder_grad_norm"] = float(decoder_gnorm)
                 if args.train_encoder:
                     rec |= {"encoder_grad_norm": float(enc_gnorm), "encoder_lr": opt.param_groups[2]["lr"]}
                 for i, (temp, clock, power) in enumerate(gpu_stats()):
@@ -581,6 +623,7 @@ def main():
                 wb.log(rec, step=step)
                 print(f"step {step} loss {rec['train/loss']:.4f} ce {rec['train/ce']:.4f} align {rec['train/align']:.3f} acc {rec['train/acc']:.4f} "
                       + (f"ctc12 {rec['train/ctc']:.4f} ctc48 {rec['train/ctc48']:.4f} enc_gn {rec['encoder_grad_norm']:.2f} dec_lr {rec['decoder_lr']:.1e} " if fast else "")
+                      + (f"dec_gn {rec['decoder_grad_norm']:.4g} " if fast and not frozen else "")
                       + f"lr {lr:.2e} "
                       f"{rec['s_per_step']:.3f} s/step {rec['bases_per_s']:.0f} bases/s", flush=True)
             t0, paused, acc = time.time(), 0.0, torch.zeros(8, device=dev)
