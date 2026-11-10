@@ -52,6 +52,7 @@ Examples:
 """
 
 import argparse
+import hashlib
 import copy
 import dataclasses
 import datetime
@@ -72,7 +73,7 @@ import torch.nn as nn
 from viktor import Basecaller, DecodeEngine, load_dorado_encoder
 from viktor.model import AlignConfig
 from viktor.chunking import repeat_pad
-from viktor.fast_encoder import FastEncoder, ctc_greedy, ctc_targets
+from viktor.fast_encoder import FastEncoder, FastEncoderConfig, ctc_greedy, ctc_targets, experiment_config
 from viktor.data import (GRANULARITY, SIZE, STRIDE, MixedDataset, WindowDataset, collate, index_files, load_windows, part_paths,
                          split_rows)
 
@@ -124,6 +125,17 @@ def unfreeze_decoder(model, step_fn, wrap, compiled):
         # zero decoder gradients while AdamW still applies weight decay.
         torch._dynamo.reset()
     return wrap()
+
+
+def initialize_fast_experiment(model, seed, dev):
+    """Identical shared initial tensors even when variants add/remove modules."""
+    with torch.random.fork_rng(devices=[dev.index]):
+        for root, network in (("encoder", model.encoder), ("projector", model.projector)):
+            for name, module in network.named_modules():
+                if isinstance(module, (nn.Linear, nn.Conv1d, nn.RMSNorm)):
+                    tag = hashlib.sha256(f"{seed}:{root}.{name}".encode()).digest()
+                    torch.manual_seed(int.from_bytes(tag[:8], "little") % (2**63 - 1))
+                    module.reset_parameters()
 
 
 def wsd(step, total, peak, warmup, decay_frac, decay_start=None):
@@ -329,6 +341,10 @@ def main():
     ap.add_argument("--encoder-warmup", type=int, default=2000, help="--train-encoder: encoder lr warmup steps")
     ap.add_argument("--encoder-arch", choices=["dorado", "fast"], default="dorado",
                     help="fast: FastEncoder from scratch (48x) + CTC head, see the module docstring")
+    ap.add_argument("--fast-variant", choices=["A", "AB", "AC", "ABC"], default="A")
+    ap.add_argument("--snapshot-every", type=int, default=0,
+                    help="retain snapshots at this interval; 0: every checkpoint (default)")
+    ap.add_argument("--heldout-n", type=int, default=None, help="free-decode sample count, default --eval-n")
     ap.add_argument("--init-decoder", help="fast: decoder weights from this checkpoint / snapshot (new run only)")
     ap.add_argument("--freeze-decoder-steps", type=int, default=0, help="fast: decoder frozen before this step")
     ap.add_argument("--decoder-lr", type=float, default=1e-4, help="fast: decoder peak lr (same WSD shape)")
@@ -392,7 +408,7 @@ def main():
     if fast:
         assert not args.train_encoder, "--encoder-arch fast trains its encoder anyway"
         ref = load_dorado_encoder(args.model_dir, load_weights=False)  # standardisation of the Dorado model
-        encoder = FastEncoder(mean=ref.mean, stdev=ref.stdev).to(dev)
+        encoder = FastEncoder(experiment_config(args.fast_variant), mean=ref.mean, stdev=ref.stdev).to(dev)
         del ref
     else:
         encoder = load_dorado_encoder(args.model_dir).to(dev)
@@ -401,6 +417,8 @@ def main():
         else:
             encoder.to(torch.float16).eval().use_koi()
     model = Basecaller.from_args(encoder, vars(args))
+    if fast:
+        initialize_fast_experiment(model, args.seed, dev)
     if not fast:
         model.set_encoder_trainable(args.train_encoder)
     if args.align_weight > 0:
@@ -420,6 +438,7 @@ def main():
         if start:
             s = torch.load(start, map_location=dev, weights_only=False)
             assert s["args"].get("encoder_arch") == "fast", "FAST --init needs a FAST checkpoint"
+            assert dataclasses.asdict(FastEncoderConfig(**s["encoder_cfg"])) == dataclasses.asdict(encoder.cfg), "FAST checkpoint architecture differs"
             assert (s["args"].get("tokenizer"), s["args"].get("layers")) == (args.tokenizer, args.layers), \
                 "--tokenizer / --layers must match the FAST --init run"
             for k in ("encoder", "projector", "decoder"):
@@ -484,8 +503,9 @@ def main():
                                      prefetch_factor=4, persistent_workers=True, pin_memory=True,
                                      multiprocessing_context="spawn")  # polars/pod5 threads do not survive fork
     wb = None
-    val = {part: fixed_windows(d, "val", args.eval_n, encoder.mean, encoder.stdev, part) for d, part, _ in sources}
-    heldout = fixed_windows(sources[0][0], "heldout", args.eval_n, encoder.mean, encoder.stdev, sources[0][1])
+    val = {(part if sum(p == part for _, p, _ in sources) == 1 else os.path.basename(os.path.normpath(d))):
+           fixed_windows(d, "val", args.eval_n, encoder.mean, encoder.stdev, part) for d, part, _ in sources}
+    heldout = fixed_windows(sources[0][0], "heldout", args.heldout_n or args.eval_n, encoder.mean, encoder.stdev, sources[0][1])
     base = os.path.join(args.out, "dorado.json")
     if not os.path.exists(base):  # all ranks decode their share; rank 0 writes
         base_enc = load_dorado_encoder(args.model_dir).to(dev, torch.float16).eval().use_koi() if fast else encoder
@@ -520,8 +540,9 @@ def main():
             state |= {"encoder": encoder.state_dict(), "enc_start": enc_start}
         torch.save(state, ckpt + ".tmp")
         os.replace(ckpt + ".tmp", ckpt)
-        torch.save({k: state[k] for k in ("step", "projector", "decoder", "args", "encoder", "encoder_cfg") if k in state},
-                   os.path.join(args.out, f"snap_{step:07d}.pt"))
+        if not args.snapshot_every or step % args.snapshot_every == 0 or step in (stop, args.freeze_decoder_steps, decay_start):
+            torch.save({k: state[k] for k in ("step", "projector", "decoder", "args", "encoder", "encoder_cfg") if k in state},
+                       os.path.join(args.out, f"snap_{step:07d}.pt"))
 
     t0, paused, acc = time.time(), 0.0, torch.zeros(8, device=dev)  # loss, ce, align sums, correct, scored, bases, ctc 12x, 48x
     for sig, valid, seqs, ws, cs in dl:
@@ -658,7 +679,7 @@ def main():
                 save()
             dist.barrier()
             if not args.no_heldout:
-                held = eval_heldout(model, heldout, 256, dev)
+                held = eval_heldout(model, heldout, min(64, len(heldout)), dev)
                 if rank == 0:
                     wb.log(held, step=step)
                 dist.barrier()
