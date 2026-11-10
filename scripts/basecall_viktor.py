@@ -24,6 +24,7 @@ from scripts.basecall_crf import STRIDE
 from viktor import Basecaller, DecodeEngine, load_dorado_encoder
 from scripts.make_head_labels import ADAPTER
 from viktor.chunking import chunk_read, repeat_pad, scale_record
+from viktor.fast_encoder import FastEncoder, FastEncoderConfig
 
 
 def overlap_cut(a, b, ov_frames, rate):
@@ -130,10 +131,13 @@ def main():
     dev = torch.device("cuda")
     s = torch.load(args.snap, map_location="cpu", weights_only=False)
     enc = load_dorado_encoder(args.model_dir)
+    fast = s["args"].get("encoder_arch") == "fast"
+    if fast:
+        enc = FastEncoder(FastEncoderConfig(**s["encoder_cfg"]), mean=enc.mean, stdev=enc.stdev)
     if "encoder" in s:  # fine-tuned (train.py --train-encoder)
         enc.load_state_dict(s["encoder"])
     enc = enc.to(dev, torch.float16).eval()
-    if args.encoder == "koi":
+    if args.encoder == "koi" and not fast:
         enc.use_koi()
     model = Basecaller.from_args(enc, s["args"])
     model.projector.load_state_dict(s["projector"])
@@ -142,7 +146,9 @@ def main():
     model.decoder.to(dev, torch.bfloat16)
     model.eval()
     max_frames = enc.chunksize // enc.stride
-    engine = DecodeEngine(model, args.batch, 2 * max_frames, max_frames)
+    # Keep the original generation budget in signal units. The FAST prefix is
+    # four times shorter, but the number of bases to generate has not changed.
+    engine = DecodeEngine(model, args.batch, 2 * (enc.chunksize // STRIDE), max_frames)
 
     overlap = args.overlap or enc.overlap
     ids = [l.strip() for l in open(args.read_ids)] if args.read_ids else None
@@ -166,9 +172,17 @@ def main():
             g = items[i:i + args.batch]
             n = len(g)
             g = g + [g[-1]] * (args.batch - n)
-            sig = torch.from_numpy(np.concatenate([it[4] for it in g])).to(dev, torch.float16)
             t1 = time.time()
-            frames, flens = enc.encode_chunks(sig, [len(it[4]) for it in g], [it[3] - it[2] for it in g])
+            if fast:
+                size = max(len(it[4]) for it in g)
+                signal = np.zeros((len(g), 1, size), dtype=np.float16)
+                for b, it in enumerate(g):
+                    signal[b, 0, :len(it[4])] = it[4]
+                sig = torch.from_numpy(signal).to(dev)
+                frames, flens = model.encode(sig, torch.tensor([it[3] - it[2] for it in g], device=dev))
+            else:
+                sig = torch.from_numpy(np.concatenate([it[4] for it in g])).to(dev, torch.float16)
+                frames, flens = enc.encode_chunks(sig, [len(it[4]) for it in g], [it[3] - it[2] for it in g])
             torch.cuda.synchronize()
             t2 = time.time()
             toks = engine.generate(frames, flens).cpu()
