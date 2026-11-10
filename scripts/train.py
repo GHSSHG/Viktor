@@ -503,8 +503,10 @@ def main():
                                      prefetch_factor=4, persistent_workers=True, pin_memory=True,
                                      multiprocessing_context="spawn")  # polars/pod5 threads do not survive fork
     wb = None
-    val = {(part if sum(p == part for _, p, _ in sources) == 1 else os.path.basename(os.path.normpath(d))):
-           fixed_windows(d, "val", args.eval_n, encoder.mean, encoder.stdev, part) for d, part, _ in sources}
+    val = {}
+    for d, part, _ in sources:
+        key = part if part not in val else f"{part}_{os.path.basename(os.path.normpath(d))}"
+        val[key] = fixed_windows(d, "val", args.eval_n, encoder.mean, encoder.stdev, part)
     heldout = fixed_windows(sources[0][0], "heldout", args.heldout_n or args.eval_n, encoder.mean, encoder.stdev, sources[0][1])
     base = os.path.join(args.out, "dorado.json")
     if not os.path.exists(base):  # all ranks decode their share; rank 0 writes

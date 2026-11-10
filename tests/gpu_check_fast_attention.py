@@ -4,6 +4,7 @@ Run: PYTHONPATH=. python tests/gpu_check_fast_attention.py
 Uses a small batch; no checkpoints or persistent outputs are produced.
 """
 import copy
+import os
 import torch
 import viktor.fast_encoder as fe
 
@@ -11,7 +12,8 @@ import viktor.fast_encoder as fe
 def main():
     assert torch.cuda.is_available() and fe.flash_attn_varlen_func is not None
     torch.manual_seed(17)
-    model = fe.FastEncoder().cuda()
+    variant = os.environ.get("FAST_VARIANT", "A")
+    model = fe.FastEncoder(fe.experiment_config(variant)).cuda()
     ref = copy.deepcopy(model)
     x = torch.randn(4, 1, 1536, device="cuda")
     lengths = torch.tensor([1536, 960, 48, 0], device="cuda")
@@ -51,7 +53,7 @@ def main():
     cy, cg = run(compiled)
     torch.testing.assert_close(cy, actual, atol=0.05, rtol=0.03)
     assert all(torch.isfinite(g).all() for g in cg.values())
-    print("PASS: full-encoder outputs, parameter gradients, padding isolation, compiled backward")
+    print(f"PASS: {variant} full-encoder outputs, parameter gradients, padding isolation, compiled backward")
 
 
 if __name__ == "__main__":
