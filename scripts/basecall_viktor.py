@@ -131,6 +131,7 @@ def main():
     dev = torch.device("cuda")
     s = torch.load(args.snap, map_location="cpu", weights_only=False)
     enc = load_dorado_encoder(args.model_dir)
+    reference_stride = enc.stride
     fast = s["args"].get("encoder_arch") == "fast"
     if fast:
         enc = FastEncoder(FastEncoderConfig(**s["encoder_cfg"]), mean=enc.mean, stdev=enc.stdev)
@@ -148,7 +149,7 @@ def main():
     max_frames = enc.chunksize // enc.stride
     # Keep the original generation budget in signal units. The FAST prefix is
     # four times shorter, but the number of bases to generate has not changed.
-    engine = DecodeEngine(model, args.batch, 2 * (enc.chunksize // STRIDE), max_frames)
+    engine = DecodeEngine(model, args.batch, 2 * (enc.chunksize // reference_stride), max_frames)
 
     overlap = args.overlap or enc.overlap
     ids = [l.strip() for l in open(args.read_ids)] if args.read_ids else None
