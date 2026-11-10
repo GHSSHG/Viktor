@@ -20,7 +20,7 @@ exec torchrun --standalone --nproc-per-node=1 -m scripts.train \
   --max-steps 200000 --decay-start 160000 --decay-steps 40000 \
   --ctc-weight 0.5 --ctc-weight-joint 0.3 --ctc48-weight 0.5 --ctc48-weight-joint 0.5 \
   --prefix-pos-scale 4 --align-sigma 1.0 \
-  --val-every 2000 --eval-n 256 --heldout-n 64 --ckpt-every 5000 --snapshot-every 40000 \
+  --val-every 10000 --eval-n 256 --heldout-n 64 --ckpt-every 20000 --snapshot-every 40000 \
   --windows "$bd/viktor_win12288_part2:part2:0.1816" \
   /data/viktor_win_v3h:part1:0.6612 /data/viktor_win_v3x:part1:0.0073 \
   "$bd/viktor_win12288_bact:bact:0.0398" "$bd/viktor_win12288_hall:hall:0.1102"
