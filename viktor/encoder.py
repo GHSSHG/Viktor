@@ -34,9 +34,9 @@ def rope_tables(dim: int, max_len: int, theta: float):
 
 
 def apply_rope(x, cos, sin):
-    """x: [B, T, H, D]; cos/sin: [T, D/2]. Rotates first half against second half."""
+    """x: [B, T, H, D]; cos/sin: [T, D/2] or [B, T, D/2]. Rotates first half against second half."""
     x1, x2 = x.float().chunk(2, -1)
-    cos, sin = cos[:, None], sin[:, None]
+    cos, sin = cos.unsqueeze(-2), sin.unsqueeze(-2)
     return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], -1).to(x.dtype)
 
 

@@ -21,6 +21,14 @@ autocast, each transformer layer recomputed in the backward (encoder.grad_ckpt);
 no weight decay), its gradients averaged over ranks after the backward and clipped separately (--clip). Its weights
 go into last.pt / snap_*.pt as "encoder" (the evaluation / basecalling scripts load them). Validation and heldout
 decoding run its forward in fp16 autocast, the inference precision.
+--encoder-arch fast: viktor.fast_encoder.FastEncoder (48x, trained from scratch) instead of the Dorado encoder,
+trained together with a new projector (lr --lr on the WSD schedule, weight decay on matrices and conv kernels) and
+a CTC head on its 12x stage (--ctc-weight, per-base CTC loss on the label; val/<part>/ctc_identity = its best-path
+calls). The decoder comes from --init-decoder (weights only, a 12x-trained decoder; --prefix-pos-scale 4 spaces
+the 48x frames as its 12x ones, alignment targets converted to 48x frames, --align-sigma in 48x frames) and stays
+frozen for the first --freeze-decoder-steps steps (checkpoint + heldout at that step), then trains at
+--decoder-lr with its own linear warmup over --decoder-warmup steps (its Adam moments start then). Encoder,
+projector and decoder all run inside DDP; encoder (+ CTC head) and the rest are clipped separately (--clip).
 Validation and heldout evaluation are sharded over all ranks (each takes windows[rank::world]), not run on rank 0 alone.
 Logged to wandb (rank 0) every --log-every steps, including each GPU's temperature / SM clock / power.
   val      every --val-every steps: teacher-forced weighted loss / base accuracy on fixed 'val' windows of every
@@ -60,7 +68,8 @@ import torch.nn as nn
 from viktor import Basecaller, DecodeEngine, load_dorado_encoder
 from viktor.model import AlignConfig
 from viktor.chunking import repeat_pad
-from viktor.data import (GRANULARITY, SIZE, MixedDataset, WindowDataset, collate, index_files, load_windows, part_paths,
+from viktor.fast_encoder import FastEncoder, ctc_greedy, ctc_targets
+from viktor.data import (GRANULARITY, SIZE, STRIDE, MixedDataset, WindowDataset, collate, index_files, load_windows, part_paths,
                          split_rows)
 
 
@@ -74,6 +83,31 @@ class Trainable(nn.Module):
 
     def forward(self, frames, tokens_in, targets, w, centers, plens):
         return self._model[0].weighted_loss(frames, tokens_in, targets, w, centers, plens)
+
+
+class FastTrainable(nn.Module):
+    """FAST encoder (+ CTC head), projector and decoder for DDP; forward = encoder, its CTC loss and
+    Basecaller.weighted_loss on its frames."""
+
+    def __init__(self, model):
+        super().__init__()
+        self.encoder, self.projector, self.decoder = model.encoder, model.projector, model.decoder
+        self._model = [model]
+
+    def forward(self, sig, lens, tokens_in, targets, w, centers, ctc_t, ctc_n, ctc_weight: float):
+        frames, mid = self.encoder(sig, lens, return_mid=True)
+        loss, ce, align, correct, scored = self._model[0].weighted_loss(frames, tokens_in, targets, w, centers,
+                                                                        lens // self.encoder.stride)
+        ctc = self.encoder.ctc_loss(mid, ctc_t, ctc_n)
+        return loss + ctc_weight * ctc, ce, align, ctc, correct, scored
+
+
+def named_groups(module, name, weight_decay):
+    """AdamW groups of one module: weight decay on matrices / conv kernels (not embeddings), none on the rest."""
+    ps = [(n, p) for n, p in module.named_parameters()]
+    dec = [p for n, p in ps if p.ndim >= 2 and "embed" not in n]
+    rest = [p for n, p in ps if not (p.ndim >= 2 and "embed" not in n)]
+    return [{"params": dec, "weight_decay": weight_decay, "name": name}, {"params": rest, "weight_decay": 0.0, "name": name}]
 
 
 def wsd(step, total, peak, warmup, decay_frac, decay_start=None):
@@ -190,25 +224,39 @@ def eval_val(model, val, batch, dev, prefix="val"):
     """Every rank scores its share of the windows (val[rank::world]); the sums are all-reduced."""
     model.eval()
     mine = val[dist.get_rank()::dist.get_world_size()]
-    loss = correct = scored = 0.0
+    loss = correct = scored = ctc_id = 0.0
+    fast = getattr(model.encoder, "masked", False)
     for i in range(0, len(mine), batch):
         g = mine[i:i + batch]
         sig, valid, seqs, ws = collate(g)
         with torch.autocast("cuda", dtype=torch.float16):  # a trained (fp32) encoder at the inference precision
-            frames, plens = model.encode(sig.to(dev), valid)
+            if fast:
+                st = model.encoder.stride
+                lens = ((valid.to(dev) + st - 1) // st * st).clamp(max=SIZE)
+                frames, mid = model.encoder(sig.to(dev), lens, return_mid=True)
+                plens = lens // st
+                calls = ctc_greedy(model.encoder.ctc_logits(mid[0]), 2 * mid[1])
+                ctc_id += sum(1 - edlib.align(c, s, mode="NW", task="distance")["editDistance"] / max(len(s), 1)
+                              for c, s in zip(calls, seqs))
+            else:
+                frames, plens = model.encode(sig.to(dev), valid)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             l, _, _, c, s = model.frame_loss(frames, seqs, ws, plens)
         loss, correct, scored = loss + float(l) * len(g), correct + float(c), scored + float(s)
     model.train()
-    tot = torch.tensor([loss, correct, scored], device=dev, dtype=torch.float64)
+    tot = torch.tensor([loss, correct, scored, ctc_id], device=dev, dtype=torch.float64)
     dist.all_reduce(tot)
-    return {f"{prefix}/loss": float(tot[0]) / len(val), f"{prefix}/acc": float(tot[1] / tot[2])}
+    out = {f"{prefix}/loss": float(tot[0]) / len(val), f"{prefix}/acc": float(tot[1] / tot[2])}
+    if fast:
+        out[f"{prefix}/ctc_identity"] = float(tot[3]) / len(val)
+    return out
 
 
 @torch.no_grad()
 def heldout_calls(model, heldout, batch, dev):
     """Free greedy decoding on a bf16 copy (the fused inference kernels need bf16 weights)."""
     inf = Basecaller(model.encoder, model.tokenizer, model.cfg)
+    inf.pos_scale = model.pos_scale
     inf.projector = copy.deepcopy(model.projector).to(torch.bfloat16).eval()
     inf.decoder = copy.deepcopy(model.decoder).to(torch.bfloat16).eval()
     eng = DecodeEngine(inf, batch, max(len(s) for _, s, _ in heldout) + 64,
@@ -261,6 +309,14 @@ def main():
     ap.add_argument("--train-encoder", action="store_true", help="fine-tune the encoder too (PyTorch layers, not koi)")
     ap.add_argument("--encoder-lr-mult", type=float, default=0.1, help="--train-encoder: encoder lr / decoder lr")
     ap.add_argument("--encoder-warmup", type=int, default=2000, help="--train-encoder: encoder lr warmup steps")
+    ap.add_argument("--encoder-arch", choices=["dorado", "fast"], default="dorado",
+                    help="fast: FastEncoder from scratch (48x) + CTC head, see the module docstring")
+    ap.add_argument("--init-decoder", help="fast: decoder weights from this checkpoint / snapshot (new run only)")
+    ap.add_argument("--freeze-decoder-steps", type=int, default=0, help="fast: decoder frozen before this step")
+    ap.add_argument("--decoder-lr", type=float, default=1e-4, help="fast: decoder peak lr (same WSD shape)")
+    ap.add_argument("--decoder-warmup", type=int, default=1000, help="fast: decoder lr warmup from its unfreezing")
+    ap.add_argument("--ctc-weight", type=float, default=0.5, help="fast: weight of the 12x CTC loss")
+    ap.add_argument("--prefix-pos-scale", type=int, default=1, help="RoPE position step of the prefix frames")
     ap.add_argument("--clip", type=float, default=1.0)
     ap.add_argument("--pad-to", type=int, default=128, help="pad label lengths to a multiple (compile shapes)")
     ap.add_argument("--tokenizer", choices=["base", "4mer"], default="base", help="decoder output unit")
@@ -308,44 +364,79 @@ def main():
         total = decay_start = args.max_steps
     stop = min(total, args.max_steps or total)
 
-    encoder = load_dorado_encoder(args.model_dir).to(dev)
-    if args.train_encoder:
-        encoder.grad_ckpt = True
+    fast = args.encoder_arch == "fast"
+    if fast:
+        assert not args.train_encoder, "--encoder-arch fast trains its encoder anyway"
+        ref = load_dorado_encoder(args.model_dir, load_weights=False)  # standardisation of the Dorado model
+        encoder = FastEncoder(mean=ref.mean, stdev=ref.stdev).to(dev)
+        del ref
     else:
-        encoder.to(torch.float16).eval().use_koi()
+        encoder = load_dorado_encoder(args.model_dir).to(dev)
+        if args.train_encoder:
+            encoder.grad_ckpt = True
+        else:
+            encoder.to(torch.float16).eval().use_koi()
     model = Basecaller.from_args(encoder, vars(args))
-    model.set_encoder_trainable(args.train_encoder)
+    if not fast:
+        model.set_encoder_trainable(args.train_encoder)
     if args.align_weight > 0:
         model.align = AlignConfig(tuple(int(x) for x in args.align_layers.split(",")),
                                   tuple(int(x) for x in args.align_heads.split(",")), args.align_sigma, args.align_weight)
     model.projector.to(dev)
     model.decoder.to(dev)
-    trainable = Trainable(model)
-    decay = [p for n, p in trainable.named_parameters() if p.ndim == 2 and "embed" not in n]
-    no_decay = [p for n, p in trainable.named_parameters() if not (p.ndim == 2 and "embed" not in n)]
-    opt = torch.optim.AdamW([{"params": decay, "weight_decay": args.weight_decay},
-                             {"params": no_decay, "weight_decay": 0.0}], lr=args.lr, betas=(0.9, 0.95), fused=True)
-    enc_group = {"params": list(encoder.parameters()), "weight_decay": 0.0}
-    step, run_id, enc_start = 0, None, 0
-    ckpt = os.path.join(args.out, "last.pt")
-    start = ckpt if os.path.exists(ckpt) else args.init
-    if start:
-        s = torch.load(start, map_location=dev, weights_only=False)
-        model.projector.load_state_dict(s["projector"])
-        model.decoder.load_state_dict(s["decoder"])
-        step = s["step"]
-        if "encoder" in s:
-            assert args.train_encoder, "a fine-tuned encoder: continue with --train-encoder"
-            encoder.load_state_dict(s["encoder"])
-        enc_start = s.get("enc_start", step)
-        if args.train_encoder and len(s["opt"]["param_groups"]) == 3:  # the encoder group was saved too
+    if fast:
+        trainable = FastTrainable(model)
+        opt = torch.optim.AdamW(named_groups(encoder, "encoder", args.weight_decay)
+                                + named_groups(model.projector, "projector", args.weight_decay)
+                                + named_groups(model.decoder, "decoder", args.weight_decay),
+                                lr=args.lr, betas=(0.9, 0.95), fused=True)
+        step, run_id, s = 0, None, None
+        ckpt = os.path.join(args.out, "last.pt")
+        if os.path.exists(ckpt):
+            s = torch.load(ckpt, map_location=dev, weights_only=False)
+            for k in ("encoder", "projector", "decoder"):
+                getattr(model, k).load_state_dict(s[k])
+            opt.load_state_dict(s["opt"])
+            step, run_id = s["step"], s.get("wandb_id")
+        elif args.init_decoder:
+            s = torch.load(args.init_decoder, map_location=dev, weights_only=False)
+            assert (s["args"].get("tokenizer"), s["args"].get("layers")) == (args.tokenizer, args.layers), \
+                "--tokenizer / --layers must match the --init-decoder run"
+            model.decoder.load_state_dict(s["decoder"])
+        del s
+        frozen = step < args.freeze_decoder_steps
+        model.decoder.requires_grad_(not frozen)
+    else:
+        trainable = Trainable(model)
+    if not fast:
+        decay = [p for n, p in trainable.named_parameters() if p.ndim == 2 and "embed" not in n]
+        no_decay = [p for n, p in trainable.named_parameters() if not (p.ndim == 2 and "embed" not in n)]
+        opt = torch.optim.AdamW([{"params": decay, "weight_decay": args.weight_decay},
+                                 {"params": no_decay, "weight_decay": 0.0}], lr=args.lr, betas=(0.9, 0.95), fused=True)
+        enc_group = {"params": list(encoder.parameters()), "weight_decay": 0.0}
+        step, run_id, enc_start = 0, None, 0
+        ckpt = os.path.join(args.out, "last.pt")
+        start = ckpt if os.path.exists(ckpt) else args.init
+        if start:
+            s = torch.load(start, map_location=dev, weights_only=False)
+            model.projector.load_state_dict(s["projector"])
+            model.decoder.load_state_dict(s["decoder"])
+            step = s["step"]
+            if "encoder" in s:
+                assert args.train_encoder, "a fine-tuned encoder: continue with --train-encoder"
+                encoder.load_state_dict(s["encoder"])
+            enc_start = s.get("enc_start", step)
+            if args.train_encoder and len(s["opt"]["param_groups"]) == 3:  # the encoder group was saved too
+                opt.add_param_group(enc_group)
+            opt.load_state_dict(s["opt"])
+            run_id = s.get("wandb_id") if start == ckpt else None
+        if args.train_encoder and len(opt.param_groups) == 2:  # its moments start at zero, hence its own warmup
             opt.add_param_group(enc_group)
-        opt.load_state_dict(s["opt"])
-        run_id = s.get("wandb_id") if start == ckpt else None
-    if args.train_encoder and len(opt.param_groups) == 2:  # its moments start at zero, hence its own warmup
-        opt.add_param_group(enc_group)
-    ddp = nn.parallel.DistributedDataParallel(trainable, device_ids=[dev.index])
-    step_fn = ddp if args.no_compile else torch.compile(ddp, dynamic=False)  # one graph per --pad-to length
+    def wrap():
+        ddp = nn.parallel.DistributedDataParallel(trainable, device_ids=[dev.index])
+        return ddp if args.no_compile else torch.compile(ddp, dynamic=False)  # one graph per --pad-to length
+
+    step_fn = wrap()
 
     seed = args.seed * 1000 + step
     parts = [WindowDataset(d, "train", encoder.mean, encoder.stdev, rank, world, seed, *part_paths(part),
@@ -360,8 +451,10 @@ def main():
     heldout = fixed_windows(sources[0][0], "heldout", args.eval_n, encoder.mean, encoder.stdev, sources[0][1])
     base = os.path.join(args.out, "dorado.json")
     if not os.path.exists(base):  # all ranks decode their share; rank 0 writes
+        base_enc = load_dorado_encoder(args.model_dir).to(dev, torch.float16).eval().use_koi() if fast else encoder
         with torch.autocast("cuda", dtype=torch.float16):
-            calls = sharded_calls(lambda w: dorado_calls(args.model_dir, encoder, w, dev) if w else [], heldout)
+            calls = sharded_calls(lambda w: dorado_calls(args.model_dir, base_enc, w, dev) if w else [], heldout)
+        del base_enc
         if rank == 0:
             with open(base, "w") as f:
                 json.dump(identity_stats(calls, heldout), f)
@@ -383,33 +476,63 @@ def main():
     def save():
         state = {"step": step, "projector": model.projector.state_dict(), "decoder": model.decoder.state_dict(),
                  "opt": opt.state_dict(), "args": vars(args), "wandb_id": run_id}
-        if args.train_encoder:
+        if fast:
+            state["encoder"] = encoder.state_dict()
+        elif args.train_encoder:
             state |= {"encoder": encoder.state_dict(), "enc_start": enc_start}
         torch.save(state, ckpt + ".tmp")
         os.replace(ckpt + ".tmp", ckpt)
         torch.save({k: state[k] for k in ("step", "projector", "decoder", "args", "encoder") if k in state},
                    os.path.join(args.out, f"snap_{step:07d}.pt"))
 
-    t0, paused, acc = time.time(), 0.0, torch.zeros(6, device=dev)  # loss, ce, align sums, correct, scored, bases
+    t0, paused, acc = time.time(), 0.0, torch.zeros(7, device=dev)  # loss, ce, align sums, correct, scored, bases, ctc
     for sig, valid, seqs, ws, cs in dl:
         if step >= stop:
             break
         if step == decay_start and rank == 0 and not os.path.exists(os.path.join(args.out, f"predecay_{step}.pt")):
             save()
             shutil.copyfile(ckpt, os.path.join(args.out, f"predecay_{step}.pt"))
+        if fast and frozen and step >= args.freeze_decoder_steps:
+            frozen = False
+            model.decoder.requires_grad_(True)
+            step_fn = wrap()
+            if rank == 0:
+                print(f"step {step}: decoder unfrozen", flush=True)
         lr = wsd(step, total, args.lr, args.warmup, args.decay_frac, decay_start)
-        for g in opt.param_groups[:2]:
-            g["lr"] = lr
-        if args.train_encoder:
-            opt.param_groups[2]["lr"] = lr * args.encoder_lr_mult * min(1.0, (step - enc_start + 1) / args.encoder_warmup)
+        if fast:
+            for g in opt.param_groups:
+                g["lr"] = lr if g["name"] != "decoder" else 0.0 if frozen else \
+                    lr / args.lr * args.decoder_lr * min(1.0, (step - args.freeze_decoder_steps + 1) / args.decoder_warmup)
+            if encoder.stride != STRIDE:  # alignment targets: 12x frame centres -> this encoder's frames
+                cs = [np.where(c >= 0, np.maximum((c * STRIDE + (STRIDE - encoder.stride) / 2) / encoder.stride, 0), -1)
+                      .astype(np.float32) for c in cs]
+        else:
+            for g in opt.param_groups[:2]:
+                g["lr"] = lr
+            if args.train_encoder:
+                opt.param_groups[2]["lr"] = lr * args.encoder_lr_mult * min(1.0, (step - enc_start + 1) / args.encoder_warmup)
         tokens_in, targets, w, centers = (t.to(dev, non_blocking=True) for t in model.batch(seqs, ws, args.pad_to, cs))
-        with torch.autocast("cuda", dtype=torch.bfloat16), torch.set_grad_enabled(args.train_encoder):
-            frames, plens = model.encode(sig.to(dev, non_blocking=True), valid)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            loss, ce, align, correct, scored = step_fn(frames, tokens_in, targets, w, centers, plens)
+        if fast:
+            st = encoder.stride
+            lens = ((valid.to(dev) + st - 1) // st * st).clamp(max=SIZE)
+            ctc_t, ctc_n = (t.to(dev, non_blocking=True) for t in ctc_targets(seqs, 4 * args.pad_to))
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                loss, ce, align, ctc, correct, scored = step_fn(sig.to(dev, non_blocking=True), lens, tokens_in, targets,
+                                                                w, centers, ctc_t, ctc_n, args.ctc_weight)
+        else:
+            with torch.autocast("cuda", dtype=torch.bfloat16), torch.set_grad_enabled(args.train_encoder):
+                frames, plens = model.encode(sig.to(dev, non_blocking=True), valid)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                loss, ce, align, correct, scored = step_fn(frames, tokens_in, targets, w, centers, plens)
+            ctc = torch.zeros_like(ce)
         opt.zero_grad(set_to_none=True)
         loss.backward()
-        gnorm = nn.utils.clip_grad_norm_(trainable.parameters(), args.clip)
+        if fast:  # inside DDP: gradients already averaged; encoder (+ CTC head) clipped on its own
+            enc_gnorm = nn.utils.clip_grad_norm_(list(encoder.parameters()), args.clip)
+            gnorm = nn.utils.clip_grad_norm_([p for p in list(model.projector.parameters()) + list(model.decoder.parameters())
+                                              if p.grad is not None], args.clip)
+        else:
+            gnorm = nn.utils.clip_grad_norm_(trainable.parameters(), args.clip)
         if args.train_encoder:  # outside DDP (encode runs it once per short window): average its gradients here
             ps = enc_group["params"]
             flat = torch.cat([(p.grad if p.grad is not None else torch.zeros_like(p)).flatten() for p in ps])
@@ -421,7 +544,7 @@ def main():
         opt.step()
         step += 1
         acc += torch.stack([loss.detach(), ce.detach(), align.detach(), correct.float(), scored.float(),
-                            torch.tensor(float(sum(map(len, seqs))), device=dev)])
+                            torch.tensor(float(sum(map(len, seqs))), device=dev), ctc.detach()])
         if step % args.temp_every == 0:
             paused += temperature_guard(rank, dev, args.temp_pause, args.temp_resume)
         if step % args.log_every == 0 or step == stop:
@@ -433,14 +556,19 @@ def main():
                        "train/align": float(acc[2]) / (n * world), "train/acc": float(acc[3] / acc[4]), "lr": lr,
                        "grad_norm": float(gnorm), "s_per_step": dt / n, "bases_per_s": float(acc[5]) / dt,
                        "paused_s": paused, "mem_gib": torch.cuda.max_memory_allocated() / 2**30}
+                if fast:
+                    rec |= {"train/ctc": float(acc[6]) / (n * world), "encoder_grad_norm": float(enc_gnorm),
+                            "decoder_lr": next(g["lr"] for g in opt.param_groups if g["name"] == "decoder")}
                 if args.train_encoder:
                     rec |= {"encoder_grad_norm": float(enc_gnorm), "encoder_lr": opt.param_groups[2]["lr"]}
                 for i, (temp, clock, power) in enumerate(gpu_stats()):
                     rec |= {f"gpu{i}/temp": temp, f"gpu{i}/sm_mhz": clock, f"gpu{i}/power_w": power}
                 wb.log(rec, step=step)
-                print(f"step {step} loss {rec['train/loss']:.4f} ce {rec['train/ce']:.4f} align {rec['train/align']:.3f} acc {rec['train/acc']:.4f} lr {lr:.2e} "
+                print(f"step {step} loss {rec['train/loss']:.4f} ce {rec['train/ce']:.4f} align {rec['train/align']:.3f} acc {rec['train/acc']:.4f} "
+                      + (f"ctc {rec['train/ctc']:.4f} enc_gn {rec['encoder_grad_norm']:.2f} dec_lr {rec['decoder_lr']:.1e} " if fast else "")
+                      + f"lr {lr:.2e} "
                       f"{rec['s_per_step']:.3f} s/step {rec['bases_per_s']:.0f} bases/s", flush=True)
-            t0, paused, acc = time.time(), 0.0, torch.zeros(6, device=dev)
+            t0, paused, acc = time.time(), 0.0, torch.zeros(7, device=dev)
         if step % args.val_every == 0:  # every rank evaluates a share
             rec = {}
             for i, (part, v) in enumerate(val.items()):
@@ -449,7 +577,7 @@ def main():
                     rec |= {"val/loss": rec[f"val/{part}/loss"], "val/acc": rec[f"val/{part}/acc"]}
             if rank == 0:
                 wb.log(rec, step=step)
-        if step % args.ckpt_every == 0 or step == stop:
+        if step % args.ckpt_every == 0 or step == stop or (fast and step == args.freeze_decoder_steps):
             if rank == 0:
                 save()
             dist.barrier()

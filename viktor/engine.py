@@ -34,8 +34,10 @@ class DecodeEngine:
         self.temperature = temperature
         dev = self.dec.lm_head.weight.device
         self.dtype = self.dec.lm_head.weight.dtype
-        if backend == "auto":
-            backend = "triton" if dev.type == "cuda" and _triton_available() else "torch"
+        self.pos_scale = getattr(model, "pos_scale", 1)
+        if backend == "auto":  # the fused kernels take RoPE positions = cache positions (pos_scale 1 only)
+            backend = "triton" if dev.type == "cuda" and _triton_available() and self.pos_scale == 1 else "torch"
+        assert backend == "torch" or self.pos_scale == 1
         self.backend = backend
         if backend == "triton":
             from .fast_decoder import FastDecoder
@@ -49,6 +51,7 @@ class DecodeEngine:
 
         self.tok = torch.full((batch_size,), BOS, dtype=torch.long, device=dev)
         self.pos = torch.zeros(batch_size, dtype=torch.long, device=dev)
+        self.rope_off = torch.zeros(batch_size, dtype=torch.long, device=dev)  # RoPE position - cache position
         self.pos32 = torch.zeros(batch_size, dtype=torch.int32, device=dev)
         self.seqlens = torch.zeros(batch_size, dtype=torch.int32, device=dev)
         self.rows = torch.arange(batch_size, dtype=torch.int32, device=dev)
@@ -80,7 +83,8 @@ class DecodeEngine:
             h = self.fast.decode(x, self.pos32, self.rows, self.seqlens, self.cache)
         else:
             self.seqlens.copy_(self.pos)
-            h = self.dec(x[:, None], cache=self.cache, pos=self.pos, seqlens=self.seqlens)[:, 0]
+            h = self.dec(x[:, None], cache=self.cache, pos=self.pos, seqlens=self.seqlens,
+                         positions=None if self.pos_scale == 1 else self.pos + self.rope_off)[:, 0]
         nxt = self._select(self.dec.head(h), self.tok)
         self.out.index_copy_(1, self.step_idx, nxt[:, None])
         self.tok.copy_(nxt)
@@ -155,13 +159,15 @@ class DecodeEngine:
                 bos = self.dec.embed(self.bos)[None]
                 for b in range(lo, hi):
                     x = torch.cat([prefix[offs[b] - offs[lo]:offs[b + 1] - offs[lo]][None], bos], 1)
-                    last.append(self.dec(x, cache=self.cache, batch_slice=slice(b, b + 1))[:, -1])
+                    rp = None if self.pos_scale == 1 else torch.arange(x.shape[1], device=x.device) * self.pos_scale
+                    last.append(self.dec(x, cache=self.cache, batch_slice=slice(b, b + 1), positions=rp)[:, -1])
         self.tok.fill_(BOS)
         first = self._select(self.dec.head(torch.cat(last)), self.tok)
         self.out.fill_(PAD)
         self.out[:, 0] = first
         self.tok.copy_(first)
         self.pos.copy_(torch.tensor(frame_lens, device=self.pos.device) + 1)
+        self.rope_off.copy_((self.pos - 1) * (self.pos_scale - 1))
         self.step_idx.fill_(1)
 
     @torch.no_grad()

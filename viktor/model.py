@@ -35,12 +35,17 @@ class Basecaller(nn.Module):
         self.projector = nn.Sequential(nn.Linear(encoder.d_model, d), nn.GELU(), nn.Linear(d, d))
         self.decoder = Decoder(self.cfg)
         self.align: Optional[AlignConfig] = None
+        # RoPE position of prefix frame j = j * pos_scale, tokens follow at pos_scale * (real frames) + i: a decoder
+        # trained on 12x frames reads 48x frames (pos_scale 4) at its own spacing. The KV cache keeps sequence order.
+        self.pos_scale = 1
 
     @classmethod
     def from_args(cls, encoder: DoradoEncoder, args: dict):
         """The model of a training run's args (a snapshot's "args"): tokenizer and decoder depth."""
         tok = get_tokenizer(args.get("tokenizer", "base"))
-        return cls(encoder, tok, DecoderConfig(vocab_size=tok.vocab_size, n_layers=args.get("layers", 8)))
+        m = cls(encoder, tok, DecoderConfig(vocab_size=tok.vocab_size, n_layers=args.get("layers", 8)))
+        m.pos_scale = args.get("prefix_pos_scale", 1)
+        return m
 
     def set_encoder_trainable(self, trainable: bool):
         if trainable and getattr(self.encoder, "koi", None) is not None:
@@ -51,8 +56,17 @@ class Basecaller(nn.Module):
         """Teacher forcing from encoder frames [B, T, d_enc]: logits for every token position, [B, T_tok, vocab].
         plens: real prefix frames per window, as in weighted_loss."""
         x, at = self.sequence(frames, tokens_in, plens)
-        h = self.decoder(x)
+        h = self.decoder(x, positions=self.rope_positions(x, frames.shape[1], plens))
         return self.decoder.head(h.float().gather(1, at[..., None].expand(-1, -1, h.shape[-1])))
+
+    def rope_positions(self, x, P, plens=None):
+        """[B, P + T] RoPE positions of sequence() output x (None at pos_scale 1: the sequence index)."""
+        if self.pos_scale == 1:
+            return None
+        B, L = x.shape[:2]
+        pos = torch.arange(L, device=x.device).expand(B, -1)
+        n = torch.full((B, 1), P, device=x.device) if plens is None else plens[:, None]
+        return torch.where(pos < n, pos * self.pos_scale, pos + (self.pos_scale - 1) * n)
 
     def sequence(self, frames, tokens_in, plens=None):
         """Decoder input [B, P + T, d] (window b: [its plens[b] frames | tokens | padding]) and each token's
@@ -80,6 +94,9 @@ class Basecaller(nn.Module):
         the real signal zero. Differentiable with the PyTorch encoder (train.py --train-encoder): inference callers
         wrap it in no_grad."""
         S, st, g = sig.shape[-1], self.encoder.stride, self.encoder.granularity
+        if getattr(self.encoder, "masked", False):  # FastEncoder: one batch, per-row lengths
+            lens = ((valid.to(sig.device) + st - 1) // st * st).clamp(max=S)
+            return self.encoder(sig, lens), lens // st
         full = valid == S
         if bool(full.all()):
             frames = self.encoder(sig)
@@ -139,10 +156,11 @@ class Basecaller(nn.Module):
         counted where the weight is positive."""
         x, at = self.sequence(frames, tokens_in, plens)
         P = frames.shape[1]
+        rp = self.rope_positions(x, P, plens)
         if centers is None or self.align is None:
-            h, qk = self.decoder(x), []
+            h, qk = self.decoder(x, positions=rp), []
         else:
-            h, qk = self.decoder.forward_probe(x, self.align.layers)
+            h, qk = self.decoder.forward_probe(x, self.align.layers, rp)
         logits = self.decoder.head(h.float().gather(1, at[..., None].expand(-1, -1, h.shape[-1])))
         ce = F.cross_entropy(logits.flatten(0, 1).float(), targets.flatten(), ignore_index=PAD,
                              reduction="none").view_as(targets)

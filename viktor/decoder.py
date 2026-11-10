@@ -132,21 +132,27 @@ class Decoder(nn.Module):
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
 
-    def forward(self, x, cache: Optional[KVCache] = None, batch_slice=slice(None), pos=None, seqlens=None):
+    def forward(self, x, cache: Optional[KVCache] = None, batch_slice=slice(None), pos=None, seqlens=None,
+                positions=None):
         """x: [B, T, d] input embeddings. pos ([B], position of each sequence's token) selects
         single-token decode mode, with seqlens = pos as int32. Returns final-normed hidden states;
-        apply `head` for logits."""
-        if pos is None:
-            cos, sin = self.cos[:x.shape[1]], self.sin[:x.shape[1]]
-        else:
-            cos, sin = self.cos[pos][:, None], self.sin[pos][:, None]
+        apply `head` for logits. positions: RoPE positions when they differ from the sequence index
+        ([T] or [B, T]; decode mode [B]); the KV cache is still indexed by sequence index."""
+        cos, sin = self._rope(x.shape[1], pos if positions is None else positions, pos is not None)
         for i, layer in enumerate(self.layers):
             x = layer(x, cos, sin, i, cache, batch_slice, pos, seqlens)
         return self.norm(x)
 
-    def forward_probe(self, x, layers):
+    def _rope(self, T, positions, decode):
+        if positions is None:
+            return self.cos[:T], self.sin[:T]
+        if decode:
+            return self.cos[positions][:, None], self.sin[positions][:, None]
+        return self.cos[positions], self.sin[positions]
+
+    def forward_probe(self, x, layers, positions=None):
         """Full causal pass (no cache) that also returns (q, k) of the given layers: (hidden, [(q, k), ...])."""
-        cos, sin = self.cos[:x.shape[1]], self.sin[:x.shape[1]]
+        cos, sin = self._rope(x.shape[1], positions, False)
         qk = []
         for i, layer in enumerate(self.layers):
             if i in layers:
