@@ -147,10 +147,11 @@ class FastEncoder(nn.Module):
 
     def ctc_loss(self, mid, targets, target_lens):
         """mid: forward's (12x output, frames per row); targets [N, L] base ids 1..4 (padded), target_lens [N].
-        Mean over rows of the per-base CTC loss."""
+        CTC loss summed over rows / all label bases of the batch (a window with few or no bases does not dominate)."""
         h, n = mid
         lp = self.ctc_logits(h).transpose(0, 1)
-        return F.ctc_loss(lp, targets, 2 * n, target_lens, blank=0, reduction="mean", zero_infinity=True)
+        loss = F.ctc_loss(lp, targets, 2 * n, target_lens, blank=0, reduction="sum", zero_infinity=True)
+        return loss / target_lens.sum().clamp(min=1)
 
 
 def ctc_greedy(logp, n):
