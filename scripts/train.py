@@ -15,6 +15,8 @@ resumable copy of the state just before the decay is kept as OUT/predecay_<step>
 or --encoder-arch fast) the learning rate stays at --lr until --max-steps, so the decay can be scheduled later by
 resuming with --decay-start. --init starts a new run (own OUT, own wandb run) from another run's resumable checkpoint
 (projector, decoder, optimizer state, step).
+For FAST, --init also accepts a weights-only snapshot: all three modules and the step are restored, with a fresh
+optimizer and separate encoder/projector and decoder warmups from that step. OUT/last.pt still takes precedence.
 --train-encoder: the encoder is trained too (full fine-tuning): PyTorch layers instead of koi, fp32 weights with bf16
 autocast, each transformer layer recomputed in the backward (encoder.grad_ckpt); its own optimizer group (lr x
 --encoder-lr-mult on the same schedule, linear warmup over --encoder-warmup steps from the step it started training,
@@ -313,7 +315,7 @@ def main():
     ap.add_argument("--model-dir", required=True)
     ap.add_argument("--windows", required=True, nargs="+", help="make_windows.py output dirs, DIR[:PART[:WEIGHT]]")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--init", help="start from this resumable checkpoint (other run's last.pt / predecay_*.pt)")
+    ap.add_argument("--init", help="start from another run's checkpoint; FAST also accepts weights-only snapshots")
     ap.add_argument("--batch", type=int, default=32, help="windows per GPU per step")
     ap.add_argument("--max-steps", type=int, default=None, help="stop early (smoke tests); default one epoch")
     ap.add_argument("--lr", type=float, default=1e-3)
@@ -412,14 +414,26 @@ def main():
                                 + named_groups(model.projector, "projector", args.weight_decay)
                                 + named_groups(model.decoder, "decoder", args.weight_decay),
                                 lr=args.lr, betas=(0.9, 0.95), fused=True)
-        step, run_id, s = 0, None, None
+        step, run_id, s, fast_opt_start = 0, None, None, 0
         ckpt = os.path.join(args.out, "last.pt")
-        if os.path.exists(ckpt):
-            s = torch.load(ckpt, map_location=dev, weights_only=False)
+        start = ckpt if os.path.exists(ckpt) else args.init
+        if start:
+            s = torch.load(start, map_location=dev, weights_only=False)
+            assert s["args"].get("encoder_arch") == "fast", "FAST --init needs a FAST checkpoint"
+            assert (s["args"].get("tokenizer"), s["args"].get("layers")) == (args.tokenizer, args.layers), \
+                "--tokenizer / --layers must match the FAST --init run"
             for k in ("encoder", "projector", "decoder"):
                 getattr(model, k).load_state_dict(s[k])
-            opt.load_state_dict(s["opt"])
-            step, run_id = s["step"], s.get("wandb_id")
+            step = s["step"]
+            if "opt" in s:
+                opt.load_state_dict(s["opt"])
+                fast_opt_start = s.get("fast_opt_start", 0)
+            else:
+                fast_opt_start = step
+                if rank == 0:
+                    print(f"FAST weights restored from {start} at step {step}; fresh optimizer, "
+                          f"encoder/projector warmup {args.warmup}, decoder warmup {args.decoder_warmup}", flush=True)
+            run_id = s.get("wandb_id") if start == ckpt else None
         elif args.init_decoder:
             s = torch.load(args.init_decoder, map_location=dev, weights_only=False)
             assert (s["args"].get("tokenizer"), s["args"].get("layers")) == (args.tokenizer, args.layers), \
@@ -500,7 +514,8 @@ def main():
         state = {"step": step, "projector": model.projector.state_dict(), "decoder": model.decoder.state_dict(),
                  "opt": opt.state_dict(), "args": vars(args), "wandb_id": run_id}
         if fast:
-            state |= {"encoder": encoder.state_dict(), "encoder_cfg": dataclasses.asdict(encoder.cfg)}
+            state |= {"encoder": encoder.state_dict(), "encoder_cfg": dataclasses.asdict(encoder.cfg),
+                      "fast_opt_start": fast_opt_start}
         elif args.train_encoder:
             state |= {"encoder": encoder.state_dict(), "enc_start": enc_start}
         torch.save(state, ckpt + ".tmp")
@@ -523,9 +538,12 @@ def main():
                 print(f"step {step}: decoder unfrozen", flush=True)
         lr = wsd(step, total, args.lr, args.warmup, args.decay_frac, decay_start)
         if fast:
+            decoder_lr = 0.0 if frozen else lr / args.lr * args.decoder_lr * min(
+                1.0, (step - max(args.freeze_decoder_steps, fast_opt_start) + 1) / max(args.decoder_warmup, 1))
+            if fast_opt_start > 0:
+                lr *= min(1.0, (step - fast_opt_start + 1) / max(args.warmup, 1))
             for g in opt.param_groups:
-                g["lr"] = lr if g["name"] != "decoder" else 0.0 if frozen else \
-                    lr / args.lr * args.decoder_lr * min(1.0, (step - args.freeze_decoder_steps + 1) / args.decoder_warmup)
+                g["lr"] = lr if g["name"] != "decoder" else decoder_lr
             if encoder.stride != STRIDE:  # alignment targets: 12x frame centres -> this encoder's frames
                 cs = [np.where(c >= 0, np.maximum((c * STRIDE + (STRIDE - encoder.stride) / 2) / encoder.stride, 0), -1)
                       .astype(np.float32) for c in cs]
