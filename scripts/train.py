@@ -23,7 +23,7 @@ go into last.pt / snap_*.pt as "encoder" (the evaluation / basecalling scripts l
 decoding run its forward in fp16 autocast, the inference precision.
 --encoder-arch fast: viktor.fast_encoder.FastEncoder (48x, trained from scratch) instead of the Dorado encoder,
 trained together with a new projector (lr --lr on the WSD schedule, weight decay on matrices and conv kernels) and
-a CTC head on its 12x stage (--ctc-weight, per-base CTC loss on the label; val/<part>/ctc_identity = its best-path
+a CTC head on its 12x stage (--ctc-weight, --ctc-weight-joint once the decoder trains; per-base CTC loss on the label; val/<part>/ctc_identity = its best-path
 calls). The decoder comes from --init-decoder (weights only, a 12x-trained decoder; --prefix-pos-scale 4 spaces
 the 48x frames as its 12x ones, alignment targets converted to 48x frames, --align-sigma in 48x frames) and stays
 frozen for the first --freeze-decoder-steps steps (checkpoint + heldout at that step), then trains at
@@ -316,6 +316,8 @@ def main():
     ap.add_argument("--decoder-lr", type=float, default=1e-4, help="fast: decoder peak lr (same WSD shape)")
     ap.add_argument("--decoder-warmup", type=int, default=1000, help="fast: decoder lr warmup from its unfreezing")
     ap.add_argument("--ctc-weight", type=float, default=0.5, help="fast: weight of the 12x CTC loss")
+    ap.add_argument("--ctc-weight-joint", type=float, default=None,
+                    help="fast: CTC weight once the decoder trains (default: --ctc-weight)")
     ap.add_argument("--prefix-pos-scale", type=int, default=1, help="RoPE position step of the prefix frames")
     ap.add_argument("--clip", type=float, default=1.0)
     ap.add_argument("--pad-to", type=int, default=128, help="pad label lengths to a multiple (compile shapes)")
@@ -514,11 +516,12 @@ def main():
         tokens_in, targets, w, centers = (t.to(dev, non_blocking=True) for t in model.batch(seqs, ws, args.pad_to, cs))
         if fast:
             st = encoder.stride
+            ctc_weight = args.ctc_weight if frozen or args.ctc_weight_joint is None else args.ctc_weight_joint
             lens = ((valid.to(dev) + st - 1) // st * st).clamp(max=SIZE)
             ctc_t, ctc_n = (t.to(dev, non_blocking=True) for t in ctc_targets(seqs, 4 * args.pad_to))
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 loss, ce, align, ctc, correct, scored = step_fn(sig.to(dev, non_blocking=True), lens, tokens_in, targets,
-                                                                w, centers, ctc_t, ctc_n, args.ctc_weight)
+                                                                w, centers, ctc_t, ctc_n, ctc_weight)
         else:
             with torch.autocast("cuda", dtype=torch.bfloat16), torch.set_grad_enabled(args.train_encoder):
                 frames, plens = model.encode(sig.to(dev, non_blocking=True), valid)
