@@ -181,6 +181,8 @@ def main():
                     signal[b, 0, :len(it[4])] = it[4]
                 sig = torch.from_numpy(signal).to(dev)
                 frames, flens = model.encode(sig, torch.tensor([it[3] - it[2] for it in g], device=dev))
+                flens = flens.tolist()
+                frames = torch.cat([h[:length] for h, length in zip(frames, flens)])
             else:
                 sig = torch.from_numpy(np.concatenate([it[4] for it in g])).to(dev, torch.float16)
                 frames, flens = enc.encode_chunks(sig, [len(it[4]) for it in g], [it[3] - it[2] for it in g])
