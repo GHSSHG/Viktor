@@ -129,6 +129,8 @@ def main():
     ap.add_argument("--encoder", choices=["torch", "koi"], required=True)
     ap.add_argument("--decoder", choices=["beam", "viterbi"], default="beam")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--read-ids", help="file with one read id per line (default: all reads)")
+    ap.add_argument("--dump-chunks", help="also write every chunk call (before stitching) to this FASTA")
     args = ap.parse_args()
 
     dev = torch.device("cuda")
@@ -142,8 +144,9 @@ def main():
 
     reads, items = {}, []  # items: (read_id, chunk_idx, start, raw_size, padded signal)
     mux = set()
+    ids = [l.strip() for l in open(args.read_ids)] if args.read_ids else None
     with pod5.Reader(args.pod5) as r:
-        for rec in r.reads():
+        for rec in r.reads(selection=ids):
             x = scale_record(rec, enc.mean, enc.stdev)
             rid = str(rec.read_id)
             spans = chunk_read(len(x), enc.chunksize, enc.overlap)
@@ -167,6 +170,10 @@ def main():
                 for (it, _), (seq, qs, moves) in zip(group, decode(head(h))):
                     results[(it[0], it[1])] = (it[2], it[3], seq, qs, moves)
 
+    if args.dump_chunks:
+        with open(args.dump_chunks, "w") as f:
+            for (rid, ci), (a, size, seq, _, _) in results.items():
+                f.write(f">{rid}_{ci}_{a}_{a + size}_{reads[rid][0]}\n{seq}\n")
     with open(args.out, "w") as f:
         for rid, (n, n_chunks) in reads.items():
             seq, qs = stitch([results[(rid, c)] for c in range(n_chunks)], n, enc.overlap)
