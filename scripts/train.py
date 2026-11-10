@@ -23,8 +23,9 @@ go into last.pt / snap_*.pt as "encoder" (the evaluation / basecalling scripts l
 decoding run its forward in fp16 autocast, the inference precision.
 --encoder-arch fast: viktor.fast_encoder.FastEncoder (48x, trained from scratch) instead of the Dorado encoder,
 trained together with a new projector (lr --lr on the WSD schedule, weight decay on matrices and conv kernels) and
-a CTC head on its 12x stage (--ctc-weight, --ctc-weight-joint once the decoder trains; per-base CTC loss on the label; val/<part>/ctc_identity = its best-path
-calls). The decoder comes from --init-decoder (weights only, a 12x-trained decoder; --prefix-pos-scale 4 spaces
+CTC heads on its 12x stage (--ctc-weight, --ctc-weight-joint once the decoder trains) and on its 48x output
+(--ctc48-weight, --ctc48-weight-joint): per-base CTC losses on the label, val/<part>/ctc12_identity and
+ctc48_identity = their best-path calls, pooled over the label bases. The decoder comes from --init-decoder (weights only, a 12x-trained decoder; --prefix-pos-scale 4 spaces
 the 48x frames as its 12x ones, alignment targets converted to 48x frames, --align-sigma in 48x frames) and stays
 frozen for the first --freeze-decoder-steps steps (checkpoint + heldout at that step), then trains at
 --decoder-lr with its own linear warmup over --decoder-warmup steps (its Adam moments start then). Encoder,
@@ -50,6 +51,7 @@ Examples:
 
 import argparse
 import copy
+import dataclasses
 import datetime
 import json
 import math
@@ -94,12 +96,13 @@ class FastTrainable(nn.Module):
         self.encoder, self.projector, self.decoder = model.encoder, model.projector, model.decoder
         self._model = [model]
 
-    def forward(self, sig, lens, tokens_in, targets, w, centers, ctc_t, ctc_n, ctc_weight: float):
-        frames, mid = self.encoder(sig, lens, return_mid=True)
+    def forward(self, sig, lens, tokens_in, targets, w, centers, ctc_t, ctc_n, w12: float, w48: float):
+        frames, (m12, m48) = self.encoder(sig, lens, return_mid=True)
         loss, ce, align, correct, scored = self._model[0].weighted_loss(frames, tokens_in, targets, w, centers,
                                                                         lens // self.encoder.stride)
-        ctc = self.encoder.ctc_loss(mid, ctc_t, ctc_n)
-        return loss + ctc_weight * ctc, ce, align, ctc, correct, scored
+        c12 = self.encoder.ctc12.loss(m12, ctc_t, ctc_n)
+        c48 = self.encoder.ctc48.loss(m48, ctc_t, ctc_n)
+        return loss + w12 * c12 + w48 * c48, ce, align, c12, c48, correct, scored
 
 
 def named_groups(module, name, weight_decay):
@@ -224,7 +227,8 @@ def eval_val(model, val, batch, dev, prefix="val"):
     """Every rank scores its share of the windows (val[rank::world]); the sums are all-reduced."""
     model.eval()
     mine = val[dist.get_rank()::dist.get_world_size()]
-    loss = correct = scored = ctc_id = 0.0
+    loss = correct = scored = 0.0
+    ctc_ed, ctc_len = np.zeros(2), 0  # 12x, 48x CTC best-path edit distances, label bases
     fast = getattr(model.encoder, "masked", False)
     for i in range(0, len(mine), batch):
         g = mine[i:i + batch]
@@ -233,22 +237,23 @@ def eval_val(model, val, batch, dev, prefix="val"):
             if fast:
                 st = model.encoder.stride
                 lens = ((valid.to(dev) + st - 1) // st * st).clamp(max=SIZE)
-                frames, mid = model.encoder(sig.to(dev), lens, return_mid=True)
+                frames, mids = model.encoder(sig.to(dev), lens, return_mid=True)
                 plens = lens // st
-                calls = ctc_greedy(model.encoder.ctc_logits(mid[0]), 2 * mid[1])
-                ctc_id += sum(1 - edlib.align(c, s, mode="NW", task="distance")["editDistance"] / max(len(s), 1)
-                              for c, s in zip(calls, seqs))
+                for j, (head, (h, n)) in enumerate(zip((model.encoder.ctc12, model.encoder.ctc48), mids)):
+                    calls = ctc_greedy(head(h), head.up * n)
+                    ctc_ed[j] += sum(edlib.align(c, s, mode="NW", task="distance")["editDistance"] for c, s in zip(calls, seqs))
+                ctc_len += sum(map(len, seqs))
             else:
                 frames, plens = model.encode(sig.to(dev), valid)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             l, _, _, c, s = model.frame_loss(frames, seqs, ws, plens)
         loss, correct, scored = loss + float(l) * len(g), correct + float(c), scored + float(s)
     model.train()
-    tot = torch.tensor([loss, correct, scored, ctc_id], device=dev, dtype=torch.float64)
+    tot = torch.tensor([loss, correct, scored, *ctc_ed, ctc_len], device=dev, dtype=torch.float64)
     dist.all_reduce(tot)
     out = {f"{prefix}/loss": float(tot[0]) / len(val), f"{prefix}/acc": float(tot[1] / tot[2])}
-    if fast:
-        out[f"{prefix}/ctc_identity"] = float(tot[3]) / len(val)
+    if fast:  # pooled over the label bases of all windows
+        out |= {f"{prefix}/ctc12_identity": 1 - float(tot[3] / tot[5]), f"{prefix}/ctc48_identity": 1 - float(tot[4] / tot[5])}
     return out
 
 
@@ -317,7 +322,11 @@ def main():
     ap.add_argument("--decoder-warmup", type=int, default=1000, help="fast: decoder lr warmup from its unfreezing")
     ap.add_argument("--ctc-weight", type=float, default=0.5, help="fast: weight of the 12x CTC loss")
     ap.add_argument("--ctc-weight-joint", type=float, default=None,
-                    help="fast: CTC weight once the decoder trains (default: --ctc-weight)")
+                    help="fast: 12x CTC weight once the decoder trains (default: --ctc-weight)")
+    ap.add_argument("--ctc48-weight", type=float, default=0.5, help="fast: weight of the 48x (encoder output) CTC loss")
+    ap.add_argument("--ctc48-weight-joint", type=float, default=None,
+                    help="fast: 48x CTC weight once the decoder trains (default: --ctc48-weight)")
+    ap.add_argument("--no-heldout", action="store_true", help="no heldout free decoding at checkpoints")
     ap.add_argument("--prefix-pos-scale", type=int, default=1, help="RoPE position step of the prefix frames")
     ap.add_argument("--clip", type=float, default=1.0)
     ap.add_argument("--pad-to", type=int, default=128, help="pad label lengths to a multiple (compile shapes)")
@@ -479,15 +488,15 @@ def main():
         state = {"step": step, "projector": model.projector.state_dict(), "decoder": model.decoder.state_dict(),
                  "opt": opt.state_dict(), "args": vars(args), "wandb_id": run_id}
         if fast:
-            state["encoder"] = encoder.state_dict()
+            state |= {"encoder": encoder.state_dict(), "encoder_cfg": dataclasses.asdict(encoder.cfg)}
         elif args.train_encoder:
             state |= {"encoder": encoder.state_dict(), "enc_start": enc_start}
         torch.save(state, ckpt + ".tmp")
         os.replace(ckpt + ".tmp", ckpt)
-        torch.save({k: state[k] for k in ("step", "projector", "decoder", "args", "encoder") if k in state},
+        torch.save({k: state[k] for k in ("step", "projector", "decoder", "args", "encoder", "encoder_cfg") if k in state},
                    os.path.join(args.out, f"snap_{step:07d}.pt"))
 
-    t0, paused, acc = time.time(), 0.0, torch.zeros(7, device=dev)  # loss, ce, align sums, correct, scored, bases, ctc
+    t0, paused, acc = time.time(), 0.0, torch.zeros(8, device=dev)  # loss, ce, align sums, correct, scored, bases, ctc 12x, 48x
     for sig, valid, seqs, ws, cs in dl:
         if step >= stop:
             break
@@ -516,18 +525,20 @@ def main():
         tokens_in, targets, w, centers = (t.to(dev, non_blocking=True) for t in model.batch(seqs, ws, args.pad_to, cs))
         if fast:
             st = encoder.stride
-            ctc_weight = args.ctc_weight if frozen or args.ctc_weight_joint is None else args.ctc_weight_joint
+            joint = not frozen
+            w12 = args.ctc_weight_joint if joint and args.ctc_weight_joint is not None else args.ctc_weight
+            w48 = args.ctc48_weight_joint if joint and args.ctc48_weight_joint is not None else args.ctc48_weight
             lens = ((valid.to(dev) + st - 1) // st * st).clamp(max=SIZE)
             ctc_t, ctc_n = (t.to(dev, non_blocking=True) for t in ctc_targets(seqs, 4 * args.pad_to))
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                loss, ce, align, ctc, correct, scored = step_fn(sig.to(dev, non_blocking=True), lens, tokens_in, targets,
-                                                                w, centers, ctc_t, ctc_n, ctc_weight)
+                loss, ce, align, ctc, ctc48, correct, scored = step_fn(sig.to(dev, non_blocking=True), lens, tokens_in,
+                                                                       targets, w, centers, ctc_t, ctc_n, w12, w48)
         else:
             with torch.autocast("cuda", dtype=torch.bfloat16), torch.set_grad_enabled(args.train_encoder):
                 frames, plens = model.encode(sig.to(dev, non_blocking=True), valid)
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 loss, ce, align, correct, scored = step_fn(frames, tokens_in, targets, w, centers, plens)
-            ctc = torch.zeros_like(ce)
+            ctc = ctc48 = torch.zeros_like(ce)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         if fast:  # inside DDP: gradients already averaged; encoder (+ CTC head) clipped on its own
@@ -547,7 +558,7 @@ def main():
         opt.step()
         step += 1
         acc += torch.stack([loss.detach(), ce.detach(), align.detach(), correct.float(), scored.float(),
-                            torch.tensor(float(sum(map(len, seqs))), device=dev), ctc.detach()])
+                            torch.tensor(float(sum(map(len, seqs))), device=dev), ctc.detach(), ctc48.detach()])
         if step % args.temp_every == 0:
             paused += temperature_guard(rank, dev, args.temp_pause, args.temp_resume)
         if step % args.log_every == 0 or step == stop:
@@ -560,7 +571,8 @@ def main():
                        "grad_norm": float(gnorm), "s_per_step": dt / n, "bases_per_s": float(acc[5]) / dt,
                        "paused_s": paused, "mem_gib": torch.cuda.max_memory_allocated() / 2**30}
                 if fast:
-                    rec |= {"train/ctc": float(acc[6]) / (n * world), "encoder_grad_norm": float(enc_gnorm),
+                    rec |= {"train/ctc": float(acc[6]) / (n * world), "train/ctc48": float(acc[7]) / (n * world),
+                            "encoder_grad_norm": float(enc_gnorm),
                             "decoder_lr": next(g["lr"] for g in opt.param_groups if g["name"] == "decoder")}
                 if args.train_encoder:
                     rec |= {"encoder_grad_norm": float(enc_gnorm), "encoder_lr": opt.param_groups[2]["lr"]}
@@ -568,10 +580,10 @@ def main():
                     rec |= {f"gpu{i}/temp": temp, f"gpu{i}/sm_mhz": clock, f"gpu{i}/power_w": power}
                 wb.log(rec, step=step)
                 print(f"step {step} loss {rec['train/loss']:.4f} ce {rec['train/ce']:.4f} align {rec['train/align']:.3f} acc {rec['train/acc']:.4f} "
-                      + (f"ctc {rec['train/ctc']:.4f} enc_gn {rec['encoder_grad_norm']:.2f} dec_lr {rec['decoder_lr']:.1e} " if fast else "")
+                      + (f"ctc12 {rec['train/ctc']:.4f} ctc48 {rec['train/ctc48']:.4f} enc_gn {rec['encoder_grad_norm']:.2f} dec_lr {rec['decoder_lr']:.1e} " if fast else "")
                       + f"lr {lr:.2e} "
                       f"{rec['s_per_step']:.3f} s/step {rec['bases_per_s']:.0f} bases/s", flush=True)
-            t0, paused, acc = time.time(), 0.0, torch.zeros(7, device=dev)
+            t0, paused, acc = time.time(), 0.0, torch.zeros(8, device=dev)
         if step % args.val_every == 0:  # every rank evaluates a share
             rec = {}
             for i, (part, v) in enumerate(val.items()):
@@ -584,10 +596,11 @@ def main():
             if rank == 0:
                 save()
             dist.barrier()
-            held = eval_heldout(model, heldout, 256, dev)
-            if rank == 0:
-                wb.log(held, step=step)
-            dist.barrier()
+            if not args.no_heldout:
+                held = eval_heldout(model, heldout, 256, dev)
+                if rank == 0:
+                    wb.log(held, step=step)
+                dist.barrier()
             t0 = time.time()
     if rank == 0:
         wb.finish()
