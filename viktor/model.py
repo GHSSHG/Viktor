@@ -164,15 +164,17 @@ class Basecaller(nn.Module):
         else:
             h, qk = self.decoder.forward_probe(x, self.align.layers, rp)
         logits = self.decoder.head(h.float().gather(1, at[..., None].expand(-1, -1, h.shape[-1])))
-        ce = F.cross_entropy(logits.flatten(0, 1).float(), targets.flatten(), ignore_index=PAD,
-                             reduction="none").view_as(targets)
-        scored = w > 0
-        ce = (ce * w).sum() / w.sum()
-        correct = ((logits.argmax(-1) == targets) & scored).sum()
+        ce, correct, scored = self.token_metrics(logits, targets, w)
         if not qk:
             return ce, ce, torch.zeros_like(ce), correct, scored.sum()
         align = self.align_loss(qk, centers, P, at, plens)
         return ce + self.align.weight * align, ce, align, correct, scored.sum()
+
+    def token_metrics(self, logits, targets, w):
+        ce = F.cross_entropy(logits.flatten(0, 1).float(), targets.flatten(), ignore_index=PAD,
+                             reduction="none").view_as(targets)
+        scored = w > 0
+        return (ce * w).sum() / w.sum(), ((logits.argmax(-1) == targets) & scored).sum(), scored
 
     def align_loss(self, qk, centers, P, at, plens=None):
         """Mean KL(target || attention over the real prefix frames) over aligned positions, heads and layers.

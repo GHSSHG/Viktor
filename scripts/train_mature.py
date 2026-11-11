@@ -32,6 +32,18 @@ def convert_centers(centers, compression):
     return [np.where(c >= 0, np.maximum((c + .5) / compression - .5, 0), -1).astype(np.float32) for c in centers]
 
 
+class CompileSafeBasecaller(Basecaller):
+    """Compile projector/Decoder, keeping CE/KL reductions on native kernels."""
+
+    @torch.compiler.disable
+    def token_metrics(self, logits, targets, w):
+        return super().token_metrics(logits, targets, w)
+
+    @torch.compiler.disable
+    def align_loss(self, qk, centers, P, at, plens=None):
+        return super().align_loss(qk, centers, P, at, plens)
+
+
 class Trainable(nn.Module):
     def __init__(self, model, compiled=True):
         super().__init__()
@@ -55,7 +67,7 @@ def build_model(args, dev):
     base.load_state_dict(state['encoder'], strict=True)
     del state
     encoder = MatureEncoder(base, args.compression)
-    model = Basecaller.from_args(encoder, vars(args))
+    model = CompileSafeBasecaller.from_args(encoder, vars(args))
     # Architecture-independent module seeds make the new decoder exactly equal.
     for root, net in [('projector', model.projector), ('decoder', model.decoder), ('compression', encoder.stages)]:
         for name, layer in net.named_modules():
