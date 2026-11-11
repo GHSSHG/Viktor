@@ -96,6 +96,7 @@ class MatureEncoder(nn.Module):
         super().__init__()
         assert compression in (1, 4)
         self.base, self.compression = base, compression
+        self.gradient_checkpointing = True
         self.stages = nn.ModuleList([CompressionStage(1024, 64), CompressionStage(2048, 32)] if compression == 4 else [])
         self.d_model, self.stride = 512 * compression, base.stride * compression
         for name in ('mean', 'stdev', 'chunksize', 'granularity', 'overlap'):
@@ -107,7 +108,7 @@ class MatureEncoder(nn.Module):
     def set_base_trainable(self, value):
         self.base_trainable = value
         self.base.requires_grad_(value)
-        self.base.grad_ckpt = value
+        self.base.grad_ckpt = value and self.gradient_checkpointing
         self.base.train(value and self.training)
 
     def train(self, mode=True):

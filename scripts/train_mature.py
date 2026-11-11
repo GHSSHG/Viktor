@@ -67,6 +67,7 @@ def build_model(args, dev):
     base.load_state_dict(state['encoder'], strict=True)
     del state
     encoder = MatureEncoder(base, args.compression)
+    encoder.gradient_checkpointing = not getattr(args, 'no_encoder_checkpointing', False)
     model = CompileSafeBasecaller.from_args(encoder, vars(args))
     # Architecture-independent module seeds make the new decoder exactly equal.
     for root, net in [('projector', model.projector), ('decoder', model.decoder), ('compression', encoder.stages)]:
@@ -152,6 +153,8 @@ def main():
     p.add_argument('--windows', nargs='+', required=True)
     p.add_argument('--batch', type=int, default=16)
     p.add_argument('--accum', type=int, default=2)
+    p.add_argument('--no-encoder-checkpointing', action='store_true',
+                   help='retain encoder activations instead of recomputing them during backward')
     p.add_argument('--max-steps', type=int, default=200000)
     p.add_argument('--freeze-encoder-steps', type=int, default=20000)
     p.add_argument('--lr', type=float, default=2e-4)
@@ -168,6 +171,7 @@ def main():
     p.add_argument('--log-every', type=int, default=100)
     p.add_argument('--val-every', type=int, default=10000)
     p.add_argument('--ckpt-every', type=int, default=20000)
+    p.add_argument('--save-every', type=int, default=1000, help='save full optimizer state independently of heldout decoding')
     p.add_argument('--eval-n', type=int, default=256)
     p.add_argument('--heldout-n', type=int, default=512)
     p.add_argument('--eval-batch', type=int, default=8)
@@ -199,8 +203,11 @@ def main():
     step, run_id = 0, None
     if ckpt.exists():
         state = torch.load(ckpt, map_location='cpu', weights_only=False)
-        for key in ('compression', 'layers', 'tokenizer', 'batch', 'accum', 'freeze_encoder_steps', 'decay_start', 'decay_steps'):
+        for key in ('compression', 'layers', 'tokenizer', 'freeze_encoder_steps', 'decay_start', 'decay_steps'):
             assert state['args'][key] == vars(args)[key], f'resume differs: {key}'
+        old_world = state.get('world', world)
+        assert old_world == world, 'resume differs: world size'
+        assert state['args']['batch'] * state['args']['accum'] == args.batch * args.accum, 'resume differs: effective batch'
         for name in ('encoder', 'projector', 'decoder'):
             getattr(model, name).load_state_dict(state[name])
         step, run_id = state['step'], state['wandb_id']
@@ -243,6 +250,7 @@ def main():
               f'compression={sum(p.numel() for p in model.encoder.stages.parameters())} '
               f'decoder={sum(p.numel() for p in model.decoder.parameters())}', flush=True)
         print('FlashAttention required in mature encoder and compression; decoder loss compiled=' + str(not args.no_compile), flush=True)
+        print(f'Encoder activation checkpointing={model.encoder.gradient_checkpointing}; batch/rank={args.batch}; accumulation={args.accum}', flush=True)
         (out/'config.json').write_text(json.dumps(vars(args), indent=2))
     dist.barrier()
 
@@ -251,7 +259,8 @@ def main():
             return
         state = {'step': step, 'args': vars(args), 'encoder': model.encoder.state_dict(),
                  'projector': model.projector.state_dict(), 'decoder': model.decoder.state_dict(),
-                 'model': model.state_dict(), 'joint': joint, 'opt': opt.state_dict(), 'wandb_id': run_id}
+                 'model': model.state_dict(), 'joint': joint, 'opt': opt.state_dict(), 'wandb_id': run_id,
+                 'world': world}
         # Avoid storing duplicate module tensors in the resumable file.
         state.pop('model')
         torch.save(state, str(ckpt)+'.tmp')
@@ -324,6 +333,20 @@ def main():
                       f'{rec["s_per_step"]:.3f} s/step memory {rec["memory_gib"]:.2f} GiB', flush=True)
             sums.zero_()
             t0, count = time.monotonic(), 0
+        requested_stop = False
+        if step % args.log_every == 0:
+            flag = torch.tensor(int((out/'STOP').exists()), device=dev)
+            dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+            requested_stop = bool(flag.item())
+        if step % args.save_every == 0 or requested_stop:
+            save()
+            dist.barrier()
+        if requested_stop:
+            if rank == 0:
+                wb.finish()
+                print(f'STOPPED safely at step {step}; full optimizer state saved', flush=True)
+            dist.destroy_process_group()
+            return
         if step % args.val_every == 0 or step == stop:
             stats = evaluate(model, val, args.eval_batch, dev)
             if rank == 0:
