@@ -93,6 +93,8 @@ class Basecaller(nn.Module):
         encoded as one batch, a short window at its repeat-padded length (encoder.encode_chunks) with its frames past
         the real signal zero. Differentiable with the PyTorch encoder (train.py --train-encoder): inference callers
         wrap it in no_grad."""
+        if hasattr(self.encoder, "encode_batch"):
+            return self.encoder.encode_batch(sig, valid)
         S, st, g = sig.shape[-1], self.encoder.stride, self.encoder.granularity
         if getattr(self.encoder, "masked", False):  # FastEncoder: one batch, per-row lengths
             lens = ((valid.to(sig.device) + st - 1) // st * st).clamp(max=S)
@@ -191,7 +193,7 @@ class Basecaller(nn.Module):
             s = torch.einsum("bthd,bphd->bhtp", qt, k[:, :P, kv]) * q.shape[-1] ** -0.5
             logq = torch.log_softmax(s.float().masked_fill(out, float("-inf")), -1)
             kl = (tgt.exp() * (tgt - logq)).masked_fill(out, 0.0).sum(-1)  # [B, heads, T]
-            total = total + (kl * mask[:, None]).sum() / (mask.sum() * len(heads))
+            total = total + (kl * mask[:, None]).sum() / (mask.sum().clamp_min(1) * len(heads))
         return total / len(qk)
 
     def frame_loss(self, frames, seqs, weights=None, plens=None):

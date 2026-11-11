@@ -25,6 +25,7 @@ from viktor import Basecaller, DecodeEngine, load_dorado_encoder
 from scripts.make_head_labels import ADAPTER
 from viktor.chunking import chunk_read, repeat_pad, scale_record
 from viktor.fast_encoder import FastEncoder, FastEncoderConfig
+from viktor.mature_encoder import MatureEncoder
 
 
 def overlap_cut(a, b, ov_frames, rate):
@@ -135,10 +136,13 @@ def main():
     fast = s["args"].get("encoder_arch") == "fast"
     if fast:
         enc = FastEncoder(FastEncoderConfig(**s["encoder_cfg"]), mean=enc.mean, stdev=enc.stdev)
+    mature = s["args"].get("encoder_arch") == "mature"
+    if mature:
+        enc = MatureEncoder(enc, s["args"]["compression"])
     if "encoder" in s:  # fine-tuned (train.py --train-encoder)
         enc.load_state_dict(s["encoder"])
     enc = enc.to(dev, torch.float16).eval()
-    if args.encoder == "koi" and not fast:
+    if args.encoder == "koi" and not fast and not mature:
         enc.use_koi()
     model = Basecaller.from_args(enc, s["args"])
     model.projector.load_state_dict(s["projector"])

@@ -76,6 +76,8 @@ class SelfAttention(nn.Module):
         if flash_attn_func is not None and q.is_cuda and q.dtype in (torch.float16, torch.bfloat16):  # q: autocast dtype
             o = flash_attn_func(q, k, v, window_size=self.window)
         else:
+            if getattr(self, "require_flash", False):
+                raise RuntimeError("Sliding FlashAttention is required: install flash-attn and use CUDA BF16/FP16")
             o = F.scaled_dot_product_attention(
                 q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
                 attn_mask=self.band_mask(T, x.device)).transpose(1, 2)
