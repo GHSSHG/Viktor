@@ -61,8 +61,8 @@ def build_model(args, dev):
         for name, layer in net.named_modules():
             if isinstance(layer, (nn.Linear, nn.Embedding, nn.Conv1d, nn.RMSNorm)):
                 seed = int.from_bytes(hashlib.sha256(f'{args.seed}:{root}.{name}'.encode()).digest()[:8], 'little') % (2**63-1)
-                with torch.random.fork_rng():
-                    torch.manual_seed(seed)
+                with torch.random.fork_rng(devices=[]):
+                    torch.default_generator.manual_seed(seed)
                     layer.reset_parameters()
     model.align = AlignConfig((1, 3), (0, 4), args.align_sigma, .1)
     return model.to(dev)
@@ -73,7 +73,7 @@ def verify_gradients(model, opt, joint):
     if model.encoder.compression == 4:
         watched['compression'] = model.encoder.stages[0].transformer.qnorm.weight
     if joint:
-        watched['encoder'] = model.encoder.base.conv[0].conv.bias
+        watched['encoder'] = model.encoder.base.conv[0].conv.weight
     for name, module in [('decoder', model.decoder), ('projector', model.projector),
                          ('compression', model.encoder.stages), ('encoder', model.encoder.base)]:
         if name == 'encoder' and not joint:
@@ -85,7 +85,7 @@ def verify_gradients(model, opt, joint):
             if p.grad is None or not torch.isfinite(p.grad).all() or p.grad.abs().max() == 0:
                 raise RuntimeError(f'{name}.{n}: missing, nonfinite or zero gradient')
     for name, p in watched.items():
-        if name in ('decoder', 'compression', 'encoder'):
+        if name in ('decoder', 'compression'):
             group = next(g for g in opt.param_groups if any(q is p for q in g['params']))
             assert group['weight_decay'] == 0, name
     return {name: (p, p.detach().clone()) for name, p in watched.items()}
@@ -96,6 +96,9 @@ def verify_updates(watched, opt):
         state = opt.state[p]
         change = (p.detach() - before).abs().max()
         assert torch.isfinite(change) and change > 0, f'{name}: no actual update'
+        group = next(g for g in opt.param_groups if any(q is p for q in g['params']))
+        decay_only = before * (1 - group['lr'] * group['weight_decay'])
+        assert (p.detach() - decay_only).abs().max() > 0, f'{name}: only weight decay changed parameters'
         assert state['exp_avg'].abs().max() > 0 and state['exp_avg_sq'].max() > 0
         # A shared value must match across ranks, not just have a nonzero gradient.
         sample = p.detach().flatten()[:256].clone()
@@ -172,6 +175,9 @@ def main():
     torch.manual_seed(args.seed)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch._dynamo.config.cache_size_limit = 64
+    # This server's Triton compiler fails on Inductor split-reduction kernels;
+    # use the established non-split reduction path, retaining compiled matmuls.
+    torch._inductor.config.split_reductions = False
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     model = build_model(args, dev)
