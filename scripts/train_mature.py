@@ -187,6 +187,7 @@ def main():
     torch.manual_seed(args.seed)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch._dynamo.config.cache_size_limit = 64
+    torch._dynamo.config.optimize_ddp = False
     # This server's Triton compiler fails on Inductor split-reduction kernels;
     # use the established non-split reduction path, retaining compiled matmuls.
     torch._inductor.config.split_reductions = False

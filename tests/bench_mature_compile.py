@@ -34,7 +34,6 @@ def main():
  # Nested compiler under DDP must not split the loss graph by DDP buckets.
  torch._dynamo.config.optimize_ddp=False
  torch.backends.cuda.matmul.allow_tf32=True
- windows=fixed_windows(a.windows,'train',64,23.506745239082388,0.,'part2') if False else None
  # Use the Encoder's actual standardisation for real training windows.
  seed_model=build_model(a,dev)
  windows=fixed_windows(a.windows,'train',64,seed_model.encoder.mean,seed_model.encoder.stdev,'part2')
