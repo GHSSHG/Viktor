@@ -27,9 +27,10 @@ failure instead of falling back to dense masked SDPA.
   `1-sqrt(progress)`, total200k optimizer updates.
 - Mature Encoder frozen/eval through20k; then added optimizer groups,
   LR1e-5 with2k warmup and same final WSD factor. Existing Adam states retained.
-- Encoder eager/FlashAttention, activation checkpointing during joint phase;
-  Decoder loss compiled. Rebuild DDP/compiled loss at unfreezing. Disable
-  Inductor split reductions for compatibility with the server's Triton compiler.
+- Encoder eager/FlashAttention, activation checkpointing during joint phase.
+  Launcher uses `--no-compile`: the server's Inductor/Triton compiler fails
+  compiling Decoder loss even with split reductions disabled. FlashAttention
+  and fused inference kernels remain enabled. Rebuild DDP at unfreezing.
 - CE + .1 alignment KL. Supervise Decoder layers1,3 (zero-based), heads0,4.
   Sigma4 at12x, sigma1 at48x, centre `(c12+.5)/compression-.5`, clamped at0
   for the first frame. Missing alignments ignored; empty alignment batches=0.
