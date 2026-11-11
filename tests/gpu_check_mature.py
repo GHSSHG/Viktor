@@ -51,18 +51,18 @@ def main():
     args.compression,args.prefix_pos_scale,args.align_sigma=4,4,1.
     b=build_model(args,dev)
     assert all(torch.equal(p.cpu(),fingerprint[n]) for n,p in b.decoder.named_parameters())
-    sig=torch.randn(2,1,1536,device=dev)
-    valid=torch.tensor([1536,801],device=dev)
+    sig=torch.randn(3,1,1536,device=dev)
+    valid=torch.tensor([1536,801,500],device=dev)
     with torch.no_grad(),torch.autocast('cuda',dtype=torch.bfloat16):
         frames,lens=b.encode(sig,valid)
         single,slens=b.encode(sig[1:2],valid[1:2])
-    assert lens.tolist()==[32,17]
+    assert lens.tolist()==[32,17,11]
     torch.testing.assert_close(frames[1,:17],single[0,:17],atol=.03,rtol=.03)
     assert frames[1,17:].abs().max()==0
     assert np.allclose(convert_centers([np.array([-1,0,1.5,5.5])],4)[0],[-1,0,0,1])
     # No valid aligned tokens must yield finite zero loss.
-    centers=torch.full((2,2),-1.,device=dev)
-    ti,ta,w=b.batch(['ACGT','ACGT'],[np.ones(4),np.ones(4)])
+    centers=torch.full((3,2),-1.,device=dev)
+    ti,ta,w=b.batch(['ACGT']*3,[np.ones(4)]*3)
     with torch.autocast('cuda',dtype=torch.bfloat16):
         _,_,align,_,_=b.weighted_loss(frames,ti.to(dev),ta.to(dev),w.to(dev),centers,lens)
     assert torch.isfinite(align) and align==0

@@ -138,12 +138,18 @@ class MatureEncoder(nn.Module):
         if bool(full.all()):
             frames = self.base_forward(sig)
         else:
-            rows = []
+            buckets = {}
             for i, n in enumerate(valid.tolist()):
                 padded = ((n + self.granularity - 1) // self.granularity) * self.granularity
-                row = self.base_forward(sig[i:i+1, :, :padded])[0]
-                rows.append(F.pad(row, (0, 0, 0, sig.shape[-1] // self.base.stride - row.shape[0])))
-            frames = torch.stack(rows)
+                buckets.setdefault(padded, []).append(i)
+            frames = None
+            for padded, ids in buckets.items():
+                idx = torch.tensor(ids, device=sig.device)
+                rows = self.base_forward(sig.index_select(0, idx)[:, :, :padded])
+                rows = F.pad(rows, (0, 0, 0, sig.shape[-1] // self.base.stride - rows.shape[1]))
+                if frames is None:
+                    frames = rows.new_zeros(sig.shape[0], rows.shape[1], rows.shape[2])
+                frames = frames.index_copy(0, idx, rows)
         lengths = (valid + self.base.stride - 1) // self.base.stride
         return self.compress(frames, lengths)
 
