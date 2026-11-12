@@ -166,10 +166,14 @@ class DoradoEncoder(nn.Module):
         Returns frames [sum(lens) / stride, d_model], chunks in order."""
         if self.koi is not None:
             return self.koi(signal, lens)
-        out, off = [], 0
-        for n in lens:
-            out.append(self.forward(signal[off:off + n].view(1, 1, n))[0])
-            off += n
+        out, off, i = [], 0, 0
+        while i < len(lens):  # runs of equal-length chunks in one call
+            j = i
+            while j < len(lens) and lens[j] == lens[i]:
+                j += 1
+            n = int(lens[i])
+            out.append(self.forward(signal[off:off + n * (j - i)].view(j - i, 1, n)).flatten(0, 1))
+            off, i = off + n * (j - i), j
         return torch.cat(out)
 
     def encode_chunks(self, signal, lens, valid):

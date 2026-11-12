@@ -142,8 +142,8 @@ def main():
     if "encoder" in s:  # fine-tuned (train.py --train-encoder)
         enc.load_state_dict(s["encoder"])
     enc = enc.to(dev, torch.float16).eval()
-    if args.encoder == "koi" and not fast and not mature:
-        enc.use_koi()
+    if args.encoder == "koi" and not fast:
+        (enc.base if mature else enc).use_koi()  # mature: the Dorado layers on koi, the compression in PyTorch
     model = Basecaller.from_args(enc, s["args"])
     model.projector.load_state_dict(s["projector"])
     model.decoder.load_state_dict(s["decoder"])

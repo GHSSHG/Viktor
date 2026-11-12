@@ -155,11 +155,12 @@ class MatureEncoder(nn.Module):
         return self.compress(frames, lengths)
 
     def encode_chunks(self, signal, lens, valid):
-        out, lengths, off = [], [], 0
-        for n, v in zip(lens, valid):
-            frames, count = self.encode_batch(signal[off:off+n].view(1, 1, n), torch.tensor([v], device=signal.device))
-            length = int(count[0])
-            out.append(frames[0, :length])
-            lengths.append(length)
-            off += n
-        return torch.cat(out), lengths
+        """Inference, one batch: the base encoder's encode_chunks (koi or PyTorch), then the compression over the
+        frames padded to [N, T, 512]. Returns (frames [sum(frame_lens), d_model], frame_lens) as DoradoEncoder."""
+        frames, flens = self.base.encode_chunks(signal, lens, valid)
+        if not self.stages:
+            return frames, flens
+        x = nn.utils.rnn.pad_sequence(frames.split(flens), batch_first=True)
+        x, n = self.compress(x, torch.tensor(flens, device=x.device))
+        n = n.tolist()
+        return torch.cat([h[:k] for h, k in zip(x, n)]), n
