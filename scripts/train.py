@@ -52,7 +52,6 @@ Examples:
 """
 
 import argparse
-import hashlib
 import copy
 import dataclasses
 import datetime
@@ -73,7 +72,7 @@ import torch.nn as nn
 from viktor import Basecaller, DecodeEngine, load_dorado_encoder
 from viktor.model import AlignConfig
 from viktor.chunking import repeat_pad
-from viktor.fast_encoder import FastEncoder, FastEncoderConfig, ctc_greedy, ctc_targets, experiment_config
+from viktor.fast_encoder import FastEncoder, FastEncoderConfig, ctc_greedy, ctc_targets
 from viktor.data import (GRANULARITY, SIZE, STRIDE, MixedDataset, WindowDataset, collate, index_files, load_windows, part_paths,
                          split_rows)
 
@@ -125,17 +124,6 @@ def unfreeze_decoder(model, step_fn, wrap, compiled):
         # zero decoder gradients while AdamW still applies weight decay.
         torch._dynamo.reset()
     return wrap()
-
-
-def initialize_fast_experiment(model, seed, dev):
-    """Identical shared initial tensors even when variants add/remove modules."""
-    with torch.random.fork_rng(devices=[dev.index]):
-        for root, network in (("encoder", model.encoder), ("projector", model.projector)):
-            for name, module in network.named_modules():
-                if isinstance(module, (nn.Linear, nn.Conv1d, nn.RMSNorm)):
-                    tag = hashlib.sha256(f"{seed}:{root}.{name}".encode()).digest()
-                    torch.manual_seed(int.from_bytes(tag[:8], "little") % (2**63 - 1))
-                    module.reset_parameters()
 
 
 def wsd(step, total, peak, warmup, decay_frac, decay_start=None):
@@ -341,7 +329,6 @@ def main():
     ap.add_argument("--encoder-warmup", type=int, default=2000, help="--train-encoder: encoder lr warmup steps")
     ap.add_argument("--encoder-arch", choices=["dorado", "fast"], default="dorado",
                     help="fast: FastEncoder from scratch (48x) + CTC head, see the module docstring")
-    ap.add_argument("--fast-variant", choices=["A", "AB", "AC", "ABC"], default="A")
     ap.add_argument("--snapshot-every", type=int, default=0,
                     help="retain snapshots at this interval; 0: every checkpoint (default)")
     ap.add_argument("--heldout-n", type=int, default=None, help="free-decode sample count, default --eval-n")
@@ -408,7 +395,7 @@ def main():
     if fast:
         assert not args.train_encoder, "--encoder-arch fast trains its encoder anyway"
         ref = load_dorado_encoder(args.model_dir, load_weights=False)  # standardisation of the Dorado model
-        encoder = FastEncoder(experiment_config(args.fast_variant), mean=ref.mean, stdev=ref.stdev).to(dev)
+        encoder = FastEncoder(mean=ref.mean, stdev=ref.stdev).to(dev)
         del ref
     else:
         encoder = load_dorado_encoder(args.model_dir).to(dev)
@@ -417,8 +404,6 @@ def main():
         else:
             encoder.to(torch.float16).eval().use_koi()
     model = Basecaller.from_args(encoder, vars(args))
-    if fast:
-        initialize_fast_experiment(model, args.seed, dev)
     if not fast:
         model.set_encoder_trainable(args.train_encoder)
     if args.align_weight > 0:

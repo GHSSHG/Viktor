@@ -53,16 +53,6 @@ class FastEncoderConfig:
     max_len: int = 8192
     chunksize: int = 12288
     overlap: int = 600
-    residual_downsample: bool = False
-
-
-def experiment_config(variant):
-    """B: local nonlinear residual downsampling; C: stage depths 4/3/1."""
-    assert variant in ("A", "AB", "AC", "ABC")
-    return FastEncoderConfig(
-        stages=((128, 4, 2, 64), (256, 3, 4, 32), (512, 1, 8, 32)) if "C" in variant
-        else FastEncoderConfig.stages,
-        residual_downsample="B" in variant)
 
 
 def _ffn(d):  # SwiGLU hidden ~ 8/3 d, a multiple of 64
@@ -125,12 +115,11 @@ class Layer(nn.Module):
 
 
 class Stage(nn.Module):
-    def __init__(self, d_in, d, n_layers, heads, window, head_dim, residual_downsample=False):
+    def __init__(self, d_in, d, n_layers, heads, window, head_dim):
         super().__init__()
         self.window = window
         self.down_norm = nn.RMSNorm(d_in) if d_in != d else None
         self.down = nn.Conv1d(d_in, d, 3, stride=2, padding=1) if d_in != d else None
-        self.local = nn.Conv1d(d_in, d_in, 7, padding=3, groups=d_in) if self.down is not None and residual_downsample else None
         self.layers = nn.ModuleList([Layer(d, heads, head_dim) for _ in range(n_layers)])
 
 
@@ -151,7 +140,7 @@ class FastEncoder(nn.Module):
         stages, d_in = [], c
         for i, (d, n, h, w) in enumerate(cfg.stages):
             assert d == h * cfg.head_dim and (i == 0) == (d_in == d)
-            stages.append(Stage(d_in, d, n, h, w, cfg.head_dim, cfg.residual_downsample))
+            stages.append(Stage(d_in, d, n, h, w, cfg.head_dim))
             d_in = d
         self.stages = nn.ModuleList(stages)
         self.norm = nn.RMSNorm(d_in)
@@ -186,18 +175,7 @@ class FastEncoder(nn.Module):
         mid = None
         for i, stage in enumerate(self.stages):
             if stage.down is not None:
-                z = stage.down_norm(h)
-                if stage.local is not None:
-                    old_valid = valid(z.shape[1], st)
-                    z = z * old_valid[..., None].to(z.dtype)
-                    local = F.silu(stage.local(z.transpose(1, 2)))
-                    local = local * old_valid[:, None].to(local.dtype)
-                    main = stage.down(local).transpose(1, 2)
-                    # Time-to-channel rearrangement; odd last frame pairs with zero.
-                    paired = F.pad(z, (0, 0, 0, z.shape[1] % 2))
-                    h = main + paired.reshape(N, -1, 2 * z.shape[-1])
-                else:
-                    h = stage.down(z.transpose(1, 2)).transpose(1, 2)
+                h = stage.down(stage.down_norm(h).transpose(1, 2)).transpose(1, 2)
                 st *= 2
             T = h.shape[1]
             v = valid(T, st)
