@@ -68,6 +68,9 @@ class DecodeEngine:
                                     device=dev)
         self.homo_stop = max_homopolymer // tk.k if max_homopolymer else 0  # run length in tokens that ends it
         self.run = torch.zeros(batch_size, dtype=torch.long, device=dev)  # repeats of the current homopolymer token
+        self.plen = torch.zeros(batch_size, dtype=torch.long, device=dev)  # prefix length: output column = pos - plen
+        # greedy triton steps: embedding inside the first norm kernel, selection + bookkeeping in one kernel
+        self.fused = backend == "triton" and temperature == 0
 
         self.graph = None
         if cuda_graph and dev.type == "cuda":
@@ -86,6 +89,13 @@ class DecodeEngine:
         return torch.where(stop, torch.full_like(nxt, PAD), nxt)
 
     def _step(self):
+        if self.fused:
+            from .triton_ops import greedy_update, linear
+            h = self.fast.decode(None, self.pos32, self.rows, self.seqlens, self.cache,
+                                 rope_pos=None if self.pos_scale == 1 else self.rpos32, tok=self.tok)
+            greedy_update(linear(h, self.dec.lm_head.weight, out_dtype=torch.float32), self.bias, self.is_tail, self.is_homo, self.homo_stop, self.tok, self.run,
+                          self.pos, self.plen, self.rope_off, self.out, self.pos32, self.seqlens, self.rpos32, EOS, PAD)
+            return
         x = self.dec.embed(self.tok)
         if self.backend == "triton":
             self.pos32.copy_(self.pos)
@@ -182,9 +192,13 @@ class DecodeEngine:
         self.out.fill_(PAD)
         self.out[:, 0] = first
         self.tok.copy_(first)
-        self.pos.copy_(torch.tensor(frame_lens, device=self.pos.device) + 1)
-        self.rope_off.copy_((self.pos - 1) * (self.pos_scale - 1))
+        self.plen.copy_(torch.tensor(frame_lens, device=self.pos.device))
+        self.pos.copy_(self.plen + 1)
+        self.rope_off.copy_(self.plen * (self.pos_scale - 1))
         self.step_idx.fill_(1)
+        self.pos32.copy_(self.pos)
+        self.seqlens.copy_(self.pos + 1)
+        self.rpos32.copy_(self.pos + self.rope_off)
 
     @torch.no_grad()
     def decode(self, steps=None):

@@ -108,6 +108,107 @@ def qkv_rope_cache(qkv, q_norm_w, k_norm_w, cos, sin, pos, seq, k_cache, v_cache
     return (q, k, v) if return_kv else q
 
 
+_LINEAR_CONFIGS = [triton.Config({"BM": bm, "BN": bn, "BK": bk}, num_warps=w, num_stages=s)
+                   for bm, bn, bk, w, s in [(16, 32, 128, 4, 3), (16, 32, 128, 4, 4), (32, 32, 128, 4, 4),
+                                            (32, 64, 64, 4, 3), (32, 64, 64, 4, 4), (32, 64, 64, 2, 3),
+                                            (64, 64, 128, 4, 3), (64, 128, 64, 4, 3)]]
+
+
+@triton.autotune(configs=_LINEAR_CONFIGS, key=["M", "N", "K", "SWIGLU"])
+@triton.jit
+def _linear_kernel(x_ptr, w_ptr, y_ptr, M, N, K, SWIGLU: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
+                   BK: tl.constexpr):
+    rm = tl.program_id(0) * BM + tl.arange(0, BM)
+    rn = tl.program_id(1) * BN + tl.arange(0, BN)
+    rk = tl.arange(0, BK)
+    acc = tl.zeros((BM, BN), tl.float32)
+    acc2 = tl.zeros((BM, BN), tl.float32)
+    for k0 in range(0, K, BK):
+        x = tl.load(x_ptr + rm[:, None] * K + (k0 + rk)[None, :], mask=rm[:, None] < M, other=0.0)
+        acc += tl.dot(x, tl.load(w_ptr + rn[None, :] * K + (k0 + rk)[:, None], mask=rn[None, :] < N, other=0.0))
+        if SWIGLU:
+            acc2 += tl.dot(x, tl.load(w_ptr + (rn[None, :] + N) * K + (k0 + rk)[:, None]))
+    out_ty = y_ptr.dtype.element_ty
+    if SWIGLU:  # rounded as the unfused path: gate / up and silu(gate) stored in bf16
+        g = acc.to(out_ty).to(tl.float32)
+        acc = (g * tl.sigmoid(g)).to(out_ty).to(tl.float32) * acc2.to(out_ty).to(tl.float32)
+    tl.store(y_ptr + rm[:, None] * N + rn[None, :], acc.to(out_ty), mask=(rm[:, None] < M) & (rn[None, :] < N))
+
+
+def linear(x, w, swiglu=False, out_dtype=None):
+    """Small-M x @ w^T (decode steps: one row per sequence); faster than cuBLAS at M <= 256. swiglu: w is
+    gate_up [2F, K] and the result silu(gate) * up [M, F] (F a multiple of 128). K a multiple of 128.
+    out_dtype: e.g. fp32 logits (not rounded to bf16 before the argmax)."""
+    M, K = x.shape
+    N = w.shape[0] // 2 if swiglu else w.shape[0]
+    y = torch.empty(M, N, dtype=out_dtype or x.dtype, device=x.device)
+    _linear_kernel[lambda m: (triton.cdiv(M, m["BM"]), triton.cdiv(N, m["BN"]))](x, w, y, M, N, K, SWIGLU=swiglu)
+    return y
+
+
+@triton.jit
+def _embed_rmsnorm_kernel(tok_ptr, emb_ptr, w_ptr, x_ptr, h_ptr, n_cols, eps, BLOCK: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    t = tl.load(tok_ptr + row).to(tl.int64)
+    cols = tl.arange(0, BLOCK)
+    m = cols < n_cols
+    x = tl.load(emb_ptr + t * n_cols + cols, mask=m, other=0.0)
+    tl.store(x_ptr + row * n_cols + cols, x, mask=m)
+    xf = x.to(tl.float32)
+    r = tl.rsqrt(tl.sum(xf * xf, 0) / n_cols + eps)
+    w = tl.load(w_ptr + cols, mask=m, other=0.0).to(tl.float32)
+    tl.store(h_ptr + row * n_cols + cols, (xf * r * w).to(h_ptr.dtype.element_ty), mask=m)
+
+
+def embed_rmsnorm(tok, emb, w, eps):
+    """tok [n] token ids -> (x = emb[tok] [n, d], RMSNorm(x) * w): the embedding lookup and the first norm."""
+    n, d = tok.shape[0], emb.shape[1]
+    x = torch.empty(n, d, dtype=emb.dtype, device=emb.device)
+    h = torch.empty_like(x)
+    _embed_rmsnorm_kernel[(n,)](tok, emb, w, x, h, d, eps, BLOCK=triton.next_power_of_2(d), num_warps=4)
+    return x, h
+
+
+@triton.jit
+def _greedy_update_kernel(logits_ptr, bias_ptr, tail_ptr, homo_ptr, tok_ptr, run_ptr, pos_ptr, plen_ptr, roff_ptr,
+                          out_ptr, pos32_ptr, seqlens_ptr, rpos32_ptr, V, out_stride, homo_stop,
+                          EOS: tl.constexpr, PAD: tl.constexpr, BLOCK: tl.constexpr):
+    b = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK)
+    m = cols < V
+    z = tl.load(logits_ptr + b * V + cols, mask=m, other=float("-inf")).to(tl.float32)
+    z = z + tl.load(bias_ptr + cols, mask=m, other=0.0)
+    nxt = tl.argmax(z, 0, tie_break_left=True).to(tl.int64)
+    prev = tl.load(tok_ptr + b)
+    nxt = tl.where(tl.load(tail_ptr + prev) != 0, EOS, nxt)  # a tail must be last
+    if homo_stop > 0:
+        same = (nxt == prev) & (tl.load(homo_ptr + nxt) != 0)
+        run = tl.where(same, tl.load(run_ptr + b) + 1, 0)
+        tl.store(run_ptr + b, run)
+        nxt = tl.where(run + 1 >= homo_stop, EOS, nxt)
+    nxt = tl.where((prev == EOS) | (prev == PAD), PAD, nxt)
+    pos = tl.load(pos_ptr + b)
+    tl.store(out_ptr + b * out_stride + pos - tl.load(plen_ptr + b), nxt)
+    tl.store(tok_ptr + b, nxt)
+    pos += 1
+    tl.store(pos_ptr + b, pos)
+    tl.store(pos32_ptr + b, pos.to(tl.int32))
+    tl.store(seqlens_ptr + b, (pos + 1).to(tl.int32))
+    tl.store(rpos32_ptr + b, (pos + tl.load(roff_ptr + b)).to(tl.int32))
+
+
+def greedy_update(logits, bias, is_tail, is_homo, homo_stop, tok, run, pos, plen, rope_off, out, pos32, seqlens,
+                  rpos32, eos, pad):
+    """One greedy decode step's bookkeeping in one kernel (DecodeEngine._select + output / state updates):
+    token = argmax(logits + bias); EOS after a tail token or when a homopolymer run reaches homo_stop tokens; PAD
+    after EOS / PAD. Writes it to out[b, pos - plen], tok, and advances pos (+ pos32, seqlens = pos + 1,
+    rpos32 = pos + rope_off for the next step)."""
+    B, V = logits.shape
+    _greedy_update_kernel[(B,)](logits, bias, is_tail, is_homo, tok, run, pos, plen, rope_off, out, pos32, seqlens,
+                                rpos32, V, out.stride(0), homo_stop, EOS=eos, PAD=pad,
+                                BLOCK=triton.next_power_of_2(V), num_warps=4)
+
+
 @triton.jit
 def _swiglu_kernel(gu_ptr, out_ptr, F, BLOCK: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)

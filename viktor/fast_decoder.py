@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
 from .decoder import Decoder, KVCache
-from .triton_ops import add_rmsnorm, qkv_rope_cache, swiglu
+from .triton_ops import add_rmsnorm, embed_rmsnorm, linear, qkv_rope_cache, swiglu
 
 
 class FastDecoder:
@@ -30,13 +30,18 @@ class FastDecoder:
             raise ValueError(f"unknown decode attention backend: {attention_backend}")
         self.attention_backend = attention_backend
 
-    def _layers(self, x, pos, seq, cache: KVCache, attend, return_kv, last_indices=None, rope_pos=None):
-        """x [n, d] residual stream (modified in place). Returns the final-normed hidden [n, d]."""
+    def _layers(self, x, pos, seq, cache: KVCache, attend, return_kv, last_indices=None, rope_pos=None, h=None,
+                small=False):
+        """x [n, d] residual stream (modified in place); h: its first attention norm, when already computed.
+        small (decode steps): the projections on the small-M Triton GEMM, SwiGLU in its epilogue.
+        Returns the final-normed hidden [n, d]."""
         cfg, layers = self.cfg, self.dec.layers
-        h = add_rmsnorm(x, layers[0].attn_norm.weight, cfg.norm_eps)
+        mm = linear if small else F.linear
+        if h is None:
+            h = add_rmsnorm(x, layers[0].attn_norm.weight, cfg.norm_eps)
         for i, blk in enumerate(layers):
             a = blk.attn
-            qkv = F.linear(h, a.qkv_proj.weight)
+            qkv = mm(h, a.qkv_proj.weight)
             r = qkv_rope_cache(qkv, a.q_norm.weight, a.k_norm.weight, self.dec.cos, self.dec.sin, pos, seq,
                                cache.k[i], cache.v[i], cfg.norm_eps, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim,
                                return_kv=return_kv, rope_pos=rope_pos)
@@ -47,9 +52,9 @@ class FastDecoder:
                 q, k, v = r
                 r = q[last_indices], k, v
             o = attend(i, r)
-            h = add_rmsnorm(x, blk.mlp_norm.weight, cfg.norm_eps, delta=F.linear(o.reshape(x.shape[0], -1),
-                                                                                    a.o_proj.weight))
-            m = F.linear(swiglu(F.linear(h, blk.gate_up.weight)), blk.down.weight)
+            h = add_rmsnorm(x, blk.mlp_norm.weight, cfg.norm_eps, delta=mm(o.reshape(x.shape[0], -1), a.o_proj.weight))
+            g = linear(h, blk.gate_up.weight, swiglu=True) if small else swiglu(F.linear(h, blk.gate_up.weight))
+            m = mm(g, blk.down.weight)
             w_next = layers[i + 1].attn_norm.weight if i + 1 < len(layers) else self.dec.norm.weight
             h = add_rmsnorm(x, w_next, cfg.norm_eps, delta=m)
         return h
@@ -68,8 +73,12 @@ class FastDecoder:
             return flash_attn_varlen_func(q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, causal=True)
         return self._layers(x, pos, seq, cache, attend, return_kv=True, last_indices=last_indices, rope_pos=rope_pos)
 
-    def decode(self, x, pos, seq, cache_seqlens, cache: KVCache, rope_pos=None):
-        """One token per sequence: x [B, d], pos/seq [B] int32, cache_seqlens = pos + 1 (int32)."""
+    def decode(self, x, pos, seq, cache_seqlens, cache: KVCache, rope_pos=None, tok=None):
+        """One token per sequence: x [B, d] (or tok [B] token ids, x None: the embedding is looked up in the first
+        norm kernel), pos/seq [B] int32, cache_seqlens = pos + 1 (int32)."""
+        h = None
+        if tok is not None:
+            x, h = embed_rmsnorm(tok, self.dec.embed.weight, self.dec.layers[0].attn_norm.weight, self.cfg.norm_eps)
         def attend(i, q):
             if self.attention_backend == "triton":
                 from .decode_attention import decode_attention
@@ -78,4 +87,4 @@ class FastDecoder:
             # identity cache_batch_idx with num_splits=1 selects the split-KV decode kernel.
             return flash_attn_with_kvcache(q[:, None], cache.k[i], cache.v[i], cache_seqlens=cache_seqlens,
                                           cache_batch_idx=seq, num_splits=1)[:, 0]
-        return self._layers(x, pos, seq, cache, attend, return_kv=False, rope_pos=rope_pos)
+        return self._layers(x, pos, seq, cache, attend, return_kv=False, rope_pos=rope_pos, h=h, small=True)

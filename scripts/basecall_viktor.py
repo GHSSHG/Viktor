@@ -125,6 +125,7 @@ def main():
                     help="cut the ligation adapter off the read start (dorado does by default)")
     ap.add_argument("--homopolymer-cap", type=int, default=60, metavar="N",
                     help="shorten runs of >= N identical bases in every chunk call to 20 before stitching (0: off)")
+    ap.add_argument("--no-compile", action="store_true", help="mature 4x: run the compression eagerly")
     ap.add_argument("--timing", help="write one TSV row per decoded batch: size, encode s, decode s, call lengths")
     ap.add_argument("--dump-chunks", help="also write every chunk call (before stitching) to this FASTA")
     args = ap.parse_args()
@@ -144,6 +145,8 @@ def main():
     enc = enc.to(dev, torch.float16).eval()
     if args.encoder == "koi" and not fast:
         (enc.base if mature else enc).use_koi()  # mature: the Dorado layers on koi, the compression in PyTorch
+    if mature and enc.stages and not args.no_compile:
+        enc.compile_compression()
     model = Basecaller.from_args(enc, s["args"])
     model.projector.load_state_dict(s["projector"])
     model.decoder.load_state_dict(s["decoder"])
