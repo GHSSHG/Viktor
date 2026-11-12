@@ -33,7 +33,7 @@ def viktor_preds(model, wins, dev, bs):
     inf = Basecaller(model.encoder, model.tokenizer, model.cfg)
     inf.projector = copy.deepcopy(model.projector).to(torch.bfloat16).eval()
     inf.decoder = copy.deepcopy(model.decoder).to(torch.bfloat16).eval()
-    eng = DecodeEngine(inf, bs, max(len(s) for _, s, _ in wins) + 64, model.encoder.chunksize // model.encoder.stride)
+    eng = DecodeEngine(inf, bs, max(len(s) for _, s, _ in wins) // model.tokenizer.k + 64, model.encoder.chunksize // model.encoder.stride)
     preds = []
     for i in range(0, len(wins), bs):
         g = wins[i:i + bs]; g = g + [g[-1]] * (bs - len(g))

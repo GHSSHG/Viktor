@@ -1,5 +1,7 @@
 """Greedy (or sampled, temperature > 0) decoding for variable-length chunks: static KV cache, packed prefill, one CUDA
 graph per step. Sampling uses the Gumbel-max trick (argmax of logits / temperature + Gumbel noise), graph-safe.
+A sequence that repeats one homopolymer token (AAAA, ...) until the run reaches max_homopolymer bases gets EOS instead
+(a decoder that does not end on a flat signal would otherwise keep its whole batch running to max_new_tokens).
 
 Each sequence's prefix is the encoder frames of its chunk's real signal + BOS, so prefix lengths differ
 and every sequence decodes at its own position. Finished sequences keep running and emit PAD, which
@@ -29,7 +31,7 @@ def _triton_available():
 class DecodeEngine:
     def __init__(self, model: Basecaller, batch_size: int, max_new_tokens: int, max_frames: int,
                  backend: str = "auto", cuda_graph: bool = True, prefill_batch: int = 128, check_every: int = 32,
-                 attention_backend: str = "auto", temperature: float = 0.0):
+                 attention_backend: str = "auto", temperature: float = 0.0, max_homopolymer: int | None = 64):
         self.model, self.dec = model, model.decoder
         self.temperature = temperature
         dev = self.dec.lm_head.weight.device
@@ -61,6 +63,11 @@ class DecodeEngine:
         self.bias = torch.zeros(model.tokenizer.vocab_size, device=dev)
         self.bias[[PAD, BOS]] = float("-inf")
         self.is_tail = model.tokenizer.tail_mask.to(dev)
+        tk = model.tokenizer
+        self.is_homo = torch.tensor([i >= 3 and len(t) == tk.k and len(set(t)) == 1 for i, t in enumerate(tk.strings)],
+                                    device=dev)
+        self.homo_stop = max_homopolymer // tk.k if max_homopolymer else 0  # run length in tokens that ends it
+        self.run = torch.zeros(batch_size, dtype=torch.long, device=dev)  # repeats of the current homopolymer token
 
         self.graph = None
         if cuda_graph and dev.type == "cuda":
@@ -72,6 +79,9 @@ class DecodeEngine:
             z = z / self.temperature - torch.log(-torch.log(torch.rand_like(z).clamp_(min=1e-20)))
         nxt = z.argmax(-1)
         nxt = torch.where(self.is_tail[prev], torch.full_like(nxt, EOS), nxt)  # a tail must be last
+        if self.homo_stop:
+            self.run.copy_(torch.where((nxt == prev) & self.is_homo[nxt], self.run + 1, 0))
+            nxt = torch.where(self.run + 1 >= self.homo_stop, torch.full_like(nxt, EOS), nxt)
         stop = (prev == EOS) | (prev == PAD)
         return torch.where(stop, torch.full_like(nxt, PAD), nxt)
 
@@ -167,6 +177,7 @@ class DecodeEngine:
                     rp = None if self.pos_scale == 1 else torch.arange(x.shape[1], device=x.device) * self.pos_scale
                     last.append(self.dec(x, cache=self.cache, batch_slice=slice(b, b + 1), positions=rp)[:, -1])
         self.tok.fill_(BOS)
+        self.run.zero_()
         first = self._select(self.dec.head(torch.cat(last)), self.tok)
         self.out.fill_(PAD)
         self.out[:, 0] = first

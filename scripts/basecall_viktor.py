@@ -151,9 +151,8 @@ def main():
     model.decoder.to(dev, torch.bfloat16)
     model.eval()
     max_frames = enc.chunksize // enc.stride
-    # Keep the original generation budget in signal units. The FAST prefix is
-    # four times shorter, but the number of bases to generate has not changed.
-    engine = DecodeEngine(model, args.batch, 2 * (enc.chunksize // reference_stride), max_frames)
+    # generation budget: 2 bases per 12x frame (a chunk holds ~900 bases), in tokens of the model's tokenizer
+    engine = DecodeEngine(model, args.batch, 2 * (enc.chunksize // reference_stride) // model.tokenizer.k, max_frames)
 
     overlap = args.overlap or enc.overlap
     ids = [l.strip() for l in open(args.read_ids)] if args.read_ids else None

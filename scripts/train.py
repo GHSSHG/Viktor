@@ -277,7 +277,7 @@ def heldout_calls(model, heldout, batch, dev):
     inf.pos_scale = model.pos_scale
     inf.projector = copy.deepcopy(model.projector).to(torch.bfloat16).eval()
     inf.decoder = copy.deepcopy(model.decoder).to(torch.bfloat16).eval()
-    eng = DecodeEngine(inf, batch, max(len(s) for _, s, _ in heldout) + 64,
+    eng = DecodeEngine(inf, batch, max(len(s) for _, s, _ in heldout) // model.tokenizer.k + 64,
                        model.encoder.chunksize // model.encoder.stride)
     preds = []
     for i in range(0, len(heldout), batch):
